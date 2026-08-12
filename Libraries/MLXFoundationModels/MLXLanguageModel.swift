@@ -562,7 +562,13 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         load: @escaping ContainerLoader
     ) {
         self.configuration = configuration
-        self.capabilities = LanguageModelCapabilities(capabilities: capabilities)
+        // Unlabeled init ONLY. The macOS 27 SDK's .swiftinterface declares both
+        // `init(capabilities:)` and `init(_:)`, but the shipping FoundationModels
+        // dylib on seed 26A5406e (2026-08-08) exports only the unlabeled one — the
+        // labeled declaration is a phantom. Calling it compiles clean and then
+        // SIGSEGVs at address 0 here, because chained fixups bind the missing
+        // symbol to null (skill apple-fm-mlx §3.10, same class as upstream #439).
+        self.capabilities = LanguageModelCapabilities(capabilities)
         self.configurationResolver = configurationResolver
         self.weightsLocation = weightsLocation
         self.load = load
