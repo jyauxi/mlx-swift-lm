@@ -458,8 +458,14 @@ public struct DeepseekOCRMessageGenerator: MessageGenerator {
         }
     }
 
+    /// mlx-vlm formats `deepseekocr` with `MessageFormat.IMAGE_TOKEN_NEWLINE`
+    /// (`prompt_utils.py`), whose token is `"<image>\n"` -- so every placeholder carries a
+    /// newline, and `prefix = token * num_images` is prepended to the user content. The
+    /// newline is a token in its own right, so omitting it shifts every position after the
+    /// lattice relative to the Python reference.
     public func generate(message: Chat.Message) -> Message {
-        let placeholders = String(repeating: imageToken, count: message.images.count)
+        let placeholders = String(
+            repeating: imageToken + "\n", count: message.images.count)
         var dictionary: Message = [
             "role": message.role.rawValue,
             "content":

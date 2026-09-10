@@ -27,7 +27,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
         XCTAssertEqual(messages.count, 2)
         XCTAssertEqual(messages[0]["content"] as? String, "You are an OCR assistant.")
-        XCTAssertEqual(messages[1]["content"] as? String, "<image><image>Parse both pages.")
+        XCTAssertEqual(messages[1]["content"] as? String, "<image>\n<image>\nParse both pages.")
         XCTAssertNil(messages[1]["content"] as? [[String: any Sendable]])
     }
 
@@ -261,7 +261,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         let template = try tokenizer.applyChatTemplate(
             messages: DeepseekOCRMessageGenerator().generate(from: input))
         XCTAssertEqual(
-            template, [999, 21, 900, 23, 900],
+            template, [999, 900, 22, 900, 24, 900],
             "the template itself must not carry BOS")
         XCTAssertEqual(ids.first, 7, "BOS comes from the tokenizer, not Python's literal 0")
         XCTAssertEqual(prepared.imagesSeqMask[0, 0].item(Bool.self), false)
@@ -283,6 +283,38 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             template, [20, 900, 22, 900],
             "the template itself must not carry BOS")
         XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7] + template)
+    }
+
+    /// mlx-vlm's `deepseekocr` entry is `MessageFormat.IMAGE_TOKEN_NEWLINE`, whose token
+    /// is `"<image>\n"`, prefixed once per image: `prefix = token * num_images` then the
+    /// prompt. The newline is its own token, so dropping it shifts every position after
+    /// the lattice away from the Python reference.
+    func testImagePlaceholdersCarryPythonsNewline() {
+        let generator = DeepseekOCRMessageGenerator()
+
+        let one = generator.generate(
+            from: UserInput(
+                prompt: "document parsing.",
+                images: [.ciImage(makeSolidImage(width: 8, height: 8, color: .red))]))
+        XCTAssertEqual(one[0]["content"] as? String, "<image>\ndocument parsing.")
+
+        let two = generator.generate(
+            from: UserInput(
+                prompt: "Multi page parsing.",
+                images: [
+                    .ciImage(makeSolidImage(width: 8, height: 8, color: .red)),
+                    .ciImage(makeSolidImage(width: 8, height: 8, color: .green)),
+                ]))
+        XCTAssertEqual(
+            two[0]["content"] as? String, "<image>\n<image>\nMulti page parsing.",
+            "prefix is the token repeated per image, then the prompt")
+
+        // An explicit placeholder in the content is still left exactly as written.
+        let explicit = generator.generate(
+            from: UserInput(
+                prompt: "before<image>after",
+                images: [.ciImage(makeSolidImage(width: 8, height: 8, color: .red))]))
+        XCTAssertEqual(explicit[0]["content"] as? String, "before<image>after")
     }
 
     /// The registry default prompt lost a trailing space because the pack template
