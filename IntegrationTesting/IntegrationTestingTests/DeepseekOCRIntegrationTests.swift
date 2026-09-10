@@ -89,7 +89,7 @@ struct UnlimitedOCRTokenizerIntegrationTests {
         let directory = try #require(hfSnapshotDir(modelId: unlimitedOCRModelId))
         let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
         let input = UserInput(
-            prompt: "document parsing. ",
+            prompt: "document parsing.",
             images: [.url(URL(fileURLWithPath: "/dev/null"))])
         let messages = DeepseekOCRMessageGenerator().generate(from: input)
 
@@ -97,7 +97,7 @@ struct UnlimitedOCRTokenizerIntegrationTests {
             messages: messages, tools: nil, additionalContext: nil)
         let imageToken = try #require(tokenizer.convertTokenToId("<image>"))
 
-        #expect(messages[0]["content"] as? String == "<image>document parsing. ")
+        #expect(messages[0]["content"] as? String == "<image>document parsing.")
         #expect(tokens.count(where: { $0 == imageToken }) == 1)
     }
 }

@@ -100,7 +100,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
     func testPrepareBaseModeOmitsLocalCropsFromLMInput() async throws {
         let processor = try makeProcessor()
         let input = UserInput(
-            prompt: "document parsing. ",
+            prompt: "document parsing.",
             images: [.ciImage(makeSolidImage(width: 800, height: 400, color: .red))],
             additionalContext: DeepseekOCRProcessor.modeContext(.base))
 
@@ -115,7 +115,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
     func testPrepareGundamModePacksLocalCropsIntoVideo() async throws {
         let processor = try makeProcessor()
         let input = UserInput(
-            prompt: "document parsing. ",
+            prompt: "document parsing.",
             images: [.ciImage(makeSolidImage(width: 800, height: 400, color: .red))])
 
         let lmInput = try await processor.prepare(input: input)
@@ -206,7 +206,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
     func testPrepareTextOnlyReturnsChatTemplateTokensWithoutAnImage() async throws {
         let processor = try makeProcessor()
-        let input = UserInput(prompt: "document parsing. ")
+        let input = UserInput(prompt: "document parsing.")
 
         let lmInput = try await processor.prepare(input: input)
 
@@ -236,7 +236,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         let processor = try makeProcessor()
 
         do {
-            _ = try await processor.internalPrepare(input: UserInput(prompt: "document parsing. "))
+            _ = try await processor.internalPrepare(input: UserInput(prompt: "document parsing."))
             XCTFail("expected VLMError.imageRequired for a text-only prompt")
         } catch VLMError.imageRequired {
             // expected
@@ -259,7 +259,9 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         let ids = prepared.inputIds.asArray(Int32.self).map(Int.init)
         let template = try tokenizer.applyChatTemplate(
             messages: DeepseekOCRMessageGenerator().generate(from: input))
-        XCTAssertEqual(template, [999, 21, 22], "the template itself must not carry BOS")
+        XCTAssertEqual(
+            template, [999, 21, 900, 23, 900],
+            "the template itself must not carry BOS")
         XCTAssertEqual(ids.first, 7, "BOS comes from the tokenizer, not Python's literal 0")
         XCTAssertEqual(prepared.imagesSeqMask[0, 0].item(Bool.self), false)
         // Template tokens follow unchanged; only the placeholder expands to the lattice.
@@ -276,8 +278,31 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
         let template = try tokenizer.applyChatTemplate(
             messages: DeepseekOCRMessageGenerator().generate(from: input))
-        XCTAssertEqual(template, [20, 21], "the template itself must not carry BOS")
+        XCTAssertEqual(
+            template, [20, 900, 22, 900],
+            "the template itself must not carry BOS")
         XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7] + template)
+    }
+
+    /// The registry default prompt lost a trailing space because the pack template
+    /// appends its own separator, so `"document parsing."` rendered a double space.
+    /// A stub that collapses whitespace cannot see that; this pins that it no longer does.
+    func testTrailingSpaceInThePromptChangesTheRenderedTemplate() throws {
+        let tokenizer = DeterministicTokenizer(bosId: 7)
+        let generator = DeepseekOCRMessageGenerator()
+
+        let clean = try tokenizer.applyChatTemplate(
+            messages: generator.generate(from: UserInput(prompt: "document parsing.")))
+        let trailing = try tokenizer.applyChatTemplate(
+            messages: generator.generate(from: UserInput(prompt: "document parsing. ")))
+
+        XCTAssertNotEqual(
+            clean, trailing,
+            "a prompt ending in a space must not tokenize the same as one that does not")
+        XCTAssertEqual(
+            trailing.suffix(2), [DeterministicTokenizer.whitespaceId, DeterministicTokenizer.whitespaceId],
+            "the prompt's own space and the template's separator are both present")
+        XCTAssertEqual(clean.last, DeterministicTokenizer.whitespaceId)
     }
 
     /// A chat template that renders `bos_token` itself must not get a second BOS.
@@ -311,7 +336,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         let probe = ProbeLinear(2048, 32)
         model.update(modules: ModuleChildren.unflattened([("projector.layers", probe as Module)]))
 
-        let lmInput = try await processor.prepare(input: UserInput(prompt: "document parsing. "))
+        let lmInput = try await processor.prepare(input: UserInput(prompt: "document parsing."))
         let cache = try model.newCache(parameters: nil)
         XCTAssertTrue(cache.allSatisfy { $0 is RingSlidingKVCache })
 
@@ -589,6 +614,9 @@ private struct DeterministicTokenizer: Tokenizer {
     /// swift-transformers encodes the rendered template with `addSpecialTokens: false`.
     var templateEmitsBOS = false
 
+    /// Emitted for each whitespace run so assertions can see separators.
+    static let whitespaceId = 900
+
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
         guard !text.isEmpty else { return [] }
         // Split on whitespace but keep DeepSeek special tokens as atomic pieces
@@ -597,7 +625,13 @@ private struct DeterministicTokenizer: Tokenizer {
         var remaining = text[...]
         while !remaining.isEmpty {
             if remaining.first?.isWhitespace == true {
-                remaining = remaining.drop(while: \.isWhitespace)
+                // One id per whitespace run. The real SentencePiece tokenizer carries
+                // whitespace into its pieces; a stub that discards it cannot tell
+                // "document parsing." from "document parsing." and so cannot see a
+                // separator regression -- which is how the double-space bug survived.
+                let run = remaining.prefix(while: \.isWhitespace)
+                ids.append(Self.whitespaceId)
+                remaining = remaining.dropFirst(run.count)
                 continue
             }
             if let match = DeepseekOCRSpecialTokens.allCases.first(where: {
@@ -658,7 +692,10 @@ private struct DeterministicTokenizer: Tokenizer {
             // The production DeepSeek/Unlimited template renders message.content directly.
             // It does not translate Qwen-style structured image parts into <image>.
             if let content = message["content"] as? String {
-                ids.append(contentsOf: encode(text: content, addSpecialTokens: false))
+                // Both packs' chat_template.jinja is `{{message['content']}} ` -- the
+                // separator is part of the template, and is why a prompt that already
+                // ends in a space double-spaces the rendered result.
+                ids.append(contentsOf: encode(text: content + " ", addSpecialTokens: false))
             }
         }
         return ids
