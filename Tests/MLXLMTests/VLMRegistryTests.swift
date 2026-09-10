@@ -51,6 +51,13 @@ final class VLMRegistryTests: XCTestCase {
                 tokenizer: StubTokenizer())
             XCTAssertTrue(processor is DeepseekOCRProcessor)
         }
+        // The placeholder the lattice is masked against. Construction succeeds
+        // whatever this says, so assert it: a fixture drifting off the shipped
+        // packs' "<image>" would mis-mask every image and no test would notice.
+        let decoded = try JSONDecoder().decode(
+            DeepseekOCRProcessorConfiguration.self,
+            from: Self.deepseekOCRProcessorConfig.data(using: .utf8)!)
+        XCTAssertEqual(decoded.imageToken, "<image>")
     }
 
     func testDeepseekOCRFactoryFailsGracefullyWhenWeightsAreMissing() async throws {
@@ -97,6 +104,51 @@ final class VLMRegistryTests: XCTestCase {
             tokenizer: StubTokenizer())
         XCTAssertTrue(processor is UnlimitedOCRProcessor)
         XCTAssertTrue(processor is DeepseekOCRProcessor)
+        let decoded = try JSONDecoder().decode(
+            UnlimitedOCRProcessorConfiguration.self,
+            from: Self.unlimitedOCRProcessorConfig.data(using: .utf8)!)
+        XCTAssertEqual(decoded.imageToken, "<image>")
+    }
+
+    /// The shipped Unlimited pack declares `model_type: deepseekocr`, so nothing but the
+    /// `_orig_model_type` shim keeps it off the plain DeepSeek path — where it would load,
+    /// generate, and grow an unbounded cache instead of the ring. This pins that routing
+    /// through the production registry at the production default, so flipping
+    /// `defaultHonorOrigModelType` fails here rather than in someone's memory graph.
+    func testShippedUnlimitedPackRoutesToRingCacheUnderTheProductionDefault() async throws {
+        let data = Self.unlimitedOCRConfig.data(using: .utf8)!
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        XCTAssertEqual(base.modelType, "deepseekocr")
+        XCTAssertEqual(base.origModelType, "unlimited-ocr")
+
+        let resolved = base.resolvedModelType(
+            honorOrigModelType: VLMModelFactory.defaultHonorOrigModelType)
+        XCTAssertEqual(
+            resolved, "unlimited-ocr",
+            "the shipped pack must resolve to Unlimited under the shipped default")
+
+        let model = try await VLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: resolved)
+        let unlimited = try XCTUnwrap(
+            model as? UnlimitedOCR, "resolved \(resolved) built \(type(of: model))")
+        for cache in try unlimited.newCache(parameters: nil) {
+            let ring = try XCTUnwrap(cache as? RingSlidingKVCache)
+            XCTAssertEqual(ring.windowSize, 128)
+        }
+    }
+
+    /// The same pack with the policy off is the regression this guards against: it builds
+    /// plain DeepSeek-OCR, whose caches grow without bound.
+    func testShippedUnlimitedPackFallsToUnboundedCacheWhenThePolicyIsOff() async throws {
+        let data = Self.unlimitedOCRConfig.data(using: .utf8)!
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        let resolved = base.resolvedModelType(honorOrigModelType: false)
+        XCTAssertEqual(resolved, "deepseekocr")
+
+        let model = try await VLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: resolved)
+        XCTAssertTrue(model is DeepseekOCR)
+        XCTAssertFalse(model is UnlimitedOCR)
     }
 
     // MARK: - `_orig_model_type` policy
@@ -358,7 +410,7 @@ extension VLMRegistryTests {
          "ignore_id": -100,
          "image_mean": [0.5, 0.5, 0.5],
          "image_std": [0.5, 0.5, 0.5],
-         "image_token": " ",
+         "image_token": "<image>",
          "mask_prompt": false,
          "normalize": true,
          "pad_token": "<｜▁pad▁｜>",
@@ -368,7 +420,10 @@ extension VLMRegistryTests {
         }
         """#
 
-    /// Native Unlimited-OCR pack shape (majentik shim remapped to model_type=unlimited-ocr).
+    /// The shipped `majentik/Unlimited-OCR-MLX-6bit` shape, verbatim in the fields that
+    /// decide routing: `model_type: deepseekocr` with `_orig_model_type: unlimited-ocr`.
+    /// No published pack carries `model_type: unlimited-ocr`; the registry keys for it
+    /// exist for callers that pass the type by hand.
     fileprivate static let unlimitedOCRConfig = #"""
         {
          "architectures": [
@@ -402,7 +457,8 @@ extension VLMRegistryTests {
          },
          "lm_head": true,
          "max_position_embeddings": 8192,
-         "model_type": "unlimited-ocr",
+         "model_type": "deepseekocr",
+         "_orig_model_type": "unlimited-ocr",
          "sliding_window": 128,
          "sliding_window_size": 128,
          "moe_intermediate_size": 896,
@@ -453,13 +509,13 @@ extension VLMRegistryTests {
          "ignore_id": -100,
          "image_mean": [0.5, 0.5, 0.5],
          "image_std": [0.5, 0.5, 0.5],
-         "image_token": " ",
+         "image_token": "<image>",
          "mask_prompt": false,
          "normalize": true,
          "pad_token": "<｜▁pad▁｜>",
          "patch_size": 16,
-         "processor_class": "UnlimitedOCRProcessor",
-         "sft_format": "unlimitedocr"
+         "processor_class": "DeepseekVLV2Processor",
+         "sft_format": "deepseek"
         }
         """#
 }
