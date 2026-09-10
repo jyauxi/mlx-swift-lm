@@ -212,10 +212,11 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
         XCTAssertNil(lmInput.image, "a text-only prompt must not fabricate an image")
         XCTAssertNil(lmInput.video)
-        // BOS from the processor, then one synthetic id per whitespace-delimited word.
-        XCTAssertEqual(lmInput.text.tokens.shape, [1, 3])
-        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self), [0, 20, 21])
-        XCTAssertEqual(lmInput.text.mask?.asArray(Int8.self), [1, 1, 1])
+        // BOS from the processor, then the template's tokens: a synthetic id per word
+        // and one per whitespace character, including the template's own separator.
+        XCTAssertEqual(lmInput.text.tokens.shape, [1, 5])
+        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self), [0, 20, 900, 22, 900])
+        XCTAssertEqual(lmInput.text.mask?.asArray(Int8.self), [1, 1, 1, 1, 1])
     }
 
     func testPrepareRejectsVideoInputInsteadOfDroppingIt() async throws {
@@ -313,7 +314,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
         let lmInput = try await processor.prepare(input: input)
 
-        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7, 20, 21])
+        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7, 20, 900, 22, 900])
     }
 
     /// Python hard-codes `bos_id = 0`; that literal is the fallback for a tokenizer that
@@ -324,7 +325,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
         let lmInput = try await processor.prepare(input: input)
 
-        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [0, 20, 21])
+        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [0, 20, 900, 22, 900])
     }
 
     /// End to end: a text-only prompt prefilled through the model (R-SWA ring caches, as on
@@ -347,8 +348,8 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         eval(output.logits)
 
         XCTAssertEqual(probe.callCount, 0, "text-only prefill must not run the vision tower")
-        XCTAssertEqual(output.logits.shape, [1, 3, 32])
-        XCTAssertEqual(cache.first?.offset, 3)
+        XCTAssertEqual(output.logits.shape, [1, 5, 32])
+        XCTAssertEqual(cache.first?.offset, 5)
 
         let direct = model(
             LMInput.Text(tokens: lmInput.text.tokens),
@@ -629,8 +630,12 @@ private struct DeterministicTokenizer: Tokenizer {
                 // whitespace into its pieces; a stub that discards it cannot tell
                 // "document parsing." from "document parsing." and so cannot see a
                 // separator regression -- which is how the double-space bug survived.
+                // One id per whitespace CHARACTER, not per run: the bug this guards
+                // against is a doubled separator, and a run-collapsing stub encodes
+                // "parsing. " and "parsing.  " identically -- blind to exactly the
+                // difference that matters.
                 let run = remaining.prefix(while: \.isWhitespace)
-                ids.append(Self.whitespaceId)
+                ids.append(contentsOf: Array(repeating: Self.whitespaceId, count: run.count))
                 remaining = remaining.dropFirst(run.count)
                 continue
             }
