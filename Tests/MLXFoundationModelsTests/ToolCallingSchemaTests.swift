@@ -262,7 +262,7 @@ struct ToolCallingSchemaTests {
     }
 
     @Test
-    func grammarBuilderHoistsNestedDefsInBothArms() throws {
+    func grammarBuilderPreservesNestedDefsInBothArms() throws {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
         let bookTrip = Transcript.ToolDefinition(
             name: "book_trip",
@@ -277,13 +277,18 @@ struct ToolCallingSchemaTests {
         let elements = try #require(format["elements"] as? [[String: Any]])
         try #require(elements.count == 2)
 
-        let wrappedSchema = try #require(
-            (elements[0]["content"] as? [String: Any])?["json_schema"] as? [String: Any]
-        )
-        let bareSchema = try #require(elements[1]["json_schema"] as? [String: Any])
-        for schema in [wrappedSchema, bareSchema] {
+        let wrappedTools = try #require(elements[0]["content"] as? [String: Any])
+        for arm in [wrappedTools, elements[1]] {
+            let tags = try #require(arm["elements"] as? [[String: Any]])
+            try #require(tags.count == 1)
+            let content = try #require(tags[0]["content"] as? [String: Any])
+            let schema = try #require(content["json_schema"] as? [String: Any])
             let defs = try #require(schema["$defs"] as? [String: Any])
-            #expect(defs["book_trip__Traveler"] != nil)
+            #expect(defs["Traveler"] != nil)
+            #expect(defs["Passport"] != nil)
+            let properties = try #require(schema["properties"] as? [String: Any])
+            let traveler = try #require(properties["traveler"] as? [String: Any])
+            #expect(traveler["$ref"] as? String == "#/$defs/Traveler")
         }
     }
 

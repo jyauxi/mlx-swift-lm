@@ -2,6 +2,12 @@
 
 An MLX adapter conforming to Apple's `FoundationModels.LanguageModel`. It provides `MLXLanguageModel` (analogous to `SystemLanguageModel`), usable directly with `LanguageModelSession`, so existing FoundationModels code (guided `@Generable` output, tool calling, streaming) works unchanged. Requires the macOS/iOS/visionOS 27.0 SDK.
 
+Build the adapter with Xcode 27. Request and response metadata use
+`ConvertibleToGeneratedContent` values. Completed responses forward input,
+cache, output, and reasoning token counts through the Foundation Models usage
+channel.
+
+
 ## Usage
 
 Build an `MLXLanguageModel` with the `#huggingFaceLanguageModel` macro and pass it to a `LanguageModelSession`.

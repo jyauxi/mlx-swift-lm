@@ -81,6 +81,48 @@ struct GenerationEventObserverTests {
         #expect(arguments == "{\"a\":1}")
     }
 
+    @Test("metadata preserves generated content values and entry identity")
+    func mirrorsMetadata() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let events = await capture { channel in
+            await MLXLanguageModel.Executor.emitMetadata(
+                ["modelID": "local-model", "incompleteOutput": true, "count": 3],
+                entryID: "e1", into: channel)
+        }
+        #expect(events.count == 1)
+        guard case .updateMetadata(let values, "e1") = events.first else {
+            Issue.record("expected metadata with response entry identity")
+            return
+        }
+        #expect(try values["modelID"]?.value(String.self) == "local-model")
+        #expect(try values["incompleteOutput"]?.value(Bool.self) == true)
+        #expect(try values["count"]?.value(Int.self) == 3)
+
+        let request = makeExecutorRequest(
+            transcript: Transcript(), metadata: ["modelID": "local-model", "count": 3])
+        #expect(try request.metadata["modelID"]?.value(String.self) == "local-model")
+        #expect(try request.metadata["count"]?.value(Int.self) == 3)
+    }
+
+    @Test("usage is delivered to the framework channel")
+    func sendsUsage() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let channel = LanguageModelExecutorGenerationChannel()
+        let received = Task {
+            var iterator = channel.makeAsyncIterator()
+            return try await iterator.next() != nil
+        }
+        await MLXLanguageModel.Executor.emitUsage(
+            input: .init(totalTokenCount: 12, cachedTokenCount: 4),
+            output: .init(totalTokenCount: 6, reasoningTokenCount: 2),
+            entryID: "e1", into: channel)
+        // Cancellation terminates the iterator if the helper stops forwarding.
+        received.cancel()
+        #expect(try await received.value)
+    }
+
     @Test("no observer attached means no crash and events are simply sent")
     func noObserverIsSafe() async {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
