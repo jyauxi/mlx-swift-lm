@@ -137,6 +137,30 @@ final class VLMRegistryTests: XCTestCase {
         }
     }
 
+    /// The test above resolves the type by hand and asks the registry directly; this one
+    /// hands the shipped pack's `config.json` to `VLMModelFactory` under the shared
+    /// factory's policy and records which registry key the factory's own resolution
+    /// invoked — then checks that the production registry builds `UnlimitedOCR` for it.
+    /// A factory that stopped honoring `_orig_model_type` would select `deepseekocr`
+    /// here and nothing else in this file would notice.
+    func testShippedUnlimitedPackSelectsTheUnlimitedCreatorThroughTheFactory() async throws {
+        let data = Self.unlimitedOCRConfig.data(using: .utf8)!
+        let factory = Self.makeProbeFactory(
+            registeredTypes: ["deepseekocr", "unlimited-ocr", "unlimited_ocr"],
+            honorOrigModelType: VLMModelFactory.shared.honorOrigModelType)
+
+        let directory = try Self.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try data.write(to: directory.appendingPathComponent("config.json"))
+
+        let selected = try await Self.selectedModelType(factory: factory, directory: directory)
+        XCTAssertEqual(selected, "unlimited-ocr")
+
+        let model = try await VLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: selected)
+        XCTAssertTrue(model is UnlimitedOCR, "\(selected) built \(type(of: model))")
+    }
+
     /// The same pack with the policy off is the regression this guards against: it builds
     /// plain DeepSeek-OCR, whose caches grow without bound.
     func testShippedUnlimitedPackFallsToUnboundedCacheWhenThePolicyIsOff() async throws {
@@ -243,6 +267,14 @@ final class VLMRegistryTests: XCTestCase {
     ) async throws -> String {
         let directory = try writeConfig(modelType: modelType, origModelType: origModelType)
         defer { try? FileManager.default.removeItem(at: directory) }
+        return try await selectedModelType(factory: factory, directory: directory)
+    }
+
+    /// Loads the pack at `directory` through `factory` and returns the registry key
+    /// whose creator the factory invoked.
+    private static func selectedModelType(
+        factory: VLMModelFactory, directory: URL
+    ) async throws -> String {
         do {
             _ = try await factory.load(from: directory, using: StubTokenizerLoader())
         } catch let probe as CreatorProbe {
