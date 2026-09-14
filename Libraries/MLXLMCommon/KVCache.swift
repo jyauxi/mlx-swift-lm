@@ -1033,14 +1033,14 @@ public class RingSlidingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 self.keys == nil
             }
         if reset {
-            let B = keys.dim(0)
+            let batch = keys.dim(0)
             let kvHeads = keys.dim(1)
             let kHeadDim = keys.dim(3)
             let vHeadDim = values.dim(3)
 
             let nSteps = (step + keys.dim(2) - 1) / step
-            let kShape = [B, kvHeads, nSteps * step, kHeadDim]
-            let vShape = [B, kvHeads, nSteps * step, vHeadDim]
+            let kShape = [batch, kvHeads, nSteps * step, kHeadDim]
+            let vShape = [batch, kvHeads, nSteps * step, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
             let newV = MLXArray.zeros(vShape, dtype: values.dtype)
 
