@@ -333,7 +333,8 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             clean, trailing,
             "a prompt ending in a space must not tokenize the same as one that does not")
         XCTAssertEqual(
-            trailing.suffix(2), [DeterministicTokenizer.whitespaceId, DeterministicTokenizer.whitespaceId],
+            trailing.suffix(2),
+            [DeterministicTokenizer.whitespaceId, DeterministicTokenizer.whitespaceId],
             "the prompt's own space and the template's separator are both present")
         XCTAssertEqual(clean.last, DeterministicTokenizer.whitespaceId)
     }
@@ -346,7 +347,8 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
         let lmInput = try await processor.prepare(input: input)
 
-        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7, 20, 900, 22, 900])
+        XCTAssertEqual(
+            lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7, 20, 900, 22, 900])
     }
 
     /// Python hard-codes `bos_id = 0`; that literal is the fallback for a tokenizer that
@@ -357,7 +359,8 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
         let lmInput = try await processor.prepare(input: input)
 
-        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [0, 20, 900, 22, 900])
+        XCTAssertEqual(
+            lmInput.text.tokens.asArray(Int32.self).map(Int.init), [0, 20, 900, 22, 900])
     }
 
     /// End to end: a text-only prompt prefilled through the model (R-SWA ring caches, as on
