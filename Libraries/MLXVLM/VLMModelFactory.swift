@@ -411,6 +411,13 @@ public final class VLMModelFactory: GenericModelFactory {
     /// mutable process-global state.
     public let honorOrigModelType: Bool
 
+    /// Returns the model's LoRA metadata without loading checkpoint weights or a processor.
+    ///
+    /// Uses the registered model's `LoRAModel` conformance to select adapter targets.
+    public func loraMetadata(configurationData: Data) async throws -> LoRAModelMetadata? {
+        try await typeRegistry.loraMetadata(configurationData: configurationData)
+    }
+
     public func _load(
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
