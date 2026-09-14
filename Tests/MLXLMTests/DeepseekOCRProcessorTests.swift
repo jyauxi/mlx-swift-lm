@@ -288,9 +288,11 @@ final class DeepseekOCRProcessorTests: XCTestCase {
     /// mlx-vlm's `deepseekocr` entry is `MessageFormat.IMAGE_TOKEN_NEWLINE`, whose token
     /// is `"<image>\n"`, prefixed once per image: `prefix = token * num_images` then the
     /// prompt. The newline is its own token, so dropping it shifts every position after
-    /// the lattice away from the Python reference.
-    func testImagePlaceholdersCarryPythonsNewline() {
+    /// the lattice away from the Python reference. This is the generator's default, so
+    /// a processor built without naming a pack renders the DeepSeek-OCR shape.
+    func testDeepseekPlaceholdersCarryPythonsNewlinePerImage() {
         let generator = DeepseekOCRMessageGenerator()
+        XCTAssertEqual(generator.imagePlaceholder, .perImageWithNewline)
 
         let one = generator.generate(
             from: UserInput(
@@ -315,6 +317,88 @@ final class DeepseekOCRProcessorTests: XCTestCase {
                 prompt: "before<image>after",
                 images: [.ciImage(makeSolidImage(width: 8, height: 8, color: .red))]))
         XCTAssertEqual(explicit[0]["content"] as? String, "before<image>after")
+    }
+
+    /// mlx-vlm's `unlimited-ocr` entry is `MessageFormat.SINGLE_IMAGE_TOKEN`: a bare
+    /// `"<image>"` with `repeat_image_token=False`, so the prefix is the token once
+    /// whatever the image count, and no newline. Two pages therefore share one
+    /// placeholder, which the processor fans out at prepare time.
+    func testUnlimitedPlaceholderIsOneBareImageTokenWhateverTheImageCount() {
+        let generator = DeepseekOCRMessageGenerator(imagePlaceholder: .single)
+
+        let one = generator.generate(
+            from: UserInput(
+                prompt: "document parsing.",
+                images: [.ciImage(makeSolidImage(width: 8, height: 8, color: .red))]))
+        XCTAssertEqual(one[0]["content"] as? String, "<image>document parsing.")
+
+        let two = generator.generate(
+            from: UserInput(
+                prompt: "Multi page parsing.",
+                images: [
+                    .ciImage(makeSolidImage(width: 8, height: 8, color: .red)),
+                    .ciImage(makeSolidImage(width: 8, height: 8, color: .green)),
+                ]))
+        XCTAssertEqual(
+            two[0]["content"] as? String, "<image>Multi page parsing.",
+            "the token is emitted once, not per image")
+
+        let none = generator.generate(from: UserInput(prompt: "document parsing."))
+        XCTAssertEqual(
+            none[0]["content"] as? String, "document parsing.",
+            "no image, no placeholder")
+
+        let explicit = generator.generate(
+            from: UserInput(
+                prompt: "before<image>after",
+                images: [.ciImage(makeSolidImage(width: 8, height: 8, color: .red))]))
+        XCTAssertEqual(explicit[0]["content"] as? String, "before<image>after")
+    }
+
+    /// The processor the `UnlimitedOCRProcessor` registry key builds carries the single
+    /// placeholder; the DeepSeek keys carry the per-image newline. Same config, same
+    /// tokenizer — only the key tells them apart, so the key must decide.
+    func testProcessorRegistryKeysPickThePackPlaceholder() async throws {
+        let config = Data(Self.processorConfigJSON.utf8)
+        let unlimited = try await VLMProcessorTypeRegistry.shared.createModel(
+            configuration: config, processorType: "UnlimitedOCRProcessor",
+            tokenizer: DeterministicTokenizer())
+        XCTAssertEqual(
+            try XCTUnwrap(unlimited as? DeepseekOCRProcessor).imagePlaceholder, .single)
+
+        for key in ["DeepseekVLV2Processor", "DeepseekOCRProcessor"] {
+            let deepseek = try await VLMProcessorTypeRegistry.shared.createModel(
+                configuration: config, processorType: key, tokenizer: DeterministicTokenizer())
+            XCTAssertEqual(
+                try XCTUnwrap(deepseek as? DeepseekOCRProcessor).imagePlaceholder,
+                .perImageWithNewline, key)
+        }
+    }
+
+    /// Two pages through the Unlimited processor take the fused path: one placeholder,
+    /// both lattices, and no newline tokens — exactly two tokens fewer than the DeepSeek
+    /// shape renders for the same input.
+    func testUnlimitedProcessorFusesTwoPagesBehindOnePlaceholder() async throws {
+        let input = UserInput(
+            prompt: "Multi page parsing.",
+            images: [
+                .ciImage(makeSolidImage(width: 800, height: 400, color: .red)),
+                .ciImage(makeSolidImage(width: 640, height: 480, color: .blue)),
+            ],
+            additionalContext: DeepseekOCRProcessor.modeContext(.base))
+
+        let unlimited = try await makeUnlimitedProcessor().internalPrepare(input: input)
+        let deepseek = try await makeProcessor().internalPrepare(input: input)
+
+        XCTAssertEqual(unlimited.pixelValues.shape, [2, 3, 1024, 1024])
+        XCTAssertEqual(unlimited.imagesSeqMask.asType(.int32).sum().item(Int.self), 546)
+        XCTAssertEqual(
+            deepseek.inputIds.shape[1] - unlimited.inputIds.shape[1], 2,
+            "the DeepSeek shape carries one newline token per page; Unlimited carries none")
+        let newlines = { (ids: MLXArray) in
+            ids.asArray(Int32.self).count(where: { $0 == DeterministicTokenizer.whitespaceId })
+        }
+        XCTAssertEqual(newlines(deepseek.inputIds) - newlines(unlimited.inputIds), 2)
     }
 
     /// The registry default prompt lost a trailing space because the pack template
@@ -545,6 +629,15 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             DeepseekOCRProcessorConfiguration.self,
             from: Data(Self.processorConfigJSON.utf8))
         return DeepseekOCRProcessor(config, tokenizer: tokenizer)
+    }
+
+    private func makeUnlimitedProcessor(tokenizer: any Tokenizer = DeterministicTokenizer())
+        throws -> DeepseekOCRProcessor
+    {
+        let config = try JSONDecoder().decode(
+            UnlimitedOCRProcessorConfiguration.self,
+            from: Data(Self.processorConfigJSON.utf8))
+        return DeepseekOCRProcessor.unlimited(config, tokenizer: tokenizer)
     }
 
     private func makeSolidImage(width: CGFloat, height: CGFloat, color: CIColor) -> CIImage {

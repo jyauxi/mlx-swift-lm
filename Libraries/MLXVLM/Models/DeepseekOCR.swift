@@ -440,11 +440,34 @@ public enum DeepseekOCRSpecialTokens: String, Sendable, CaseIterable {
 ///
 /// These checkpoints render `message.content` directly, so image placeholders must be
 /// embedded in string content rather than represented as Qwen-style structured parts.
+/// The two packs spell that placeholder differently; ``ImagePlaceholder`` carries the
+/// choice so the pack that built the processor decides, not the caller.
 public struct DeepseekOCRMessageGenerator: MessageGenerator {
-    public let imageToken: String
 
-    public init(imageToken: String = "<image>") {
+    /// How image placeholders are prefixed to the user content.
+    ///
+    /// mlx-vlm keys this on `model_type` (`prompt_utils.py`, `MODEL_FORMATS`): the two OCR
+    /// packs share a processor but not a prompt shape, and the difference is a token in
+    /// its own right, so the wrong shape shifts every position after the image lattice
+    /// relative to the Python reference.
+    public enum ImagePlaceholder: Sendable {
+        /// `deepseekocr` → `MessageFormat.IMAGE_TOKEN_NEWLINE`: the token is `"<image>\n"`
+        /// and the prefix is `token * num_images`, one per image.
+        case perImageWithNewline
+        /// `unlimited-ocr` → `MessageFormat.SINGLE_IMAGE_TOKEN`: a bare `"<image>"` emitted
+        /// once whatever the image count (`repeat_image_token=False`). The processor fans
+        /// that one placeholder out to every page.
+        case single
+    }
+
+    public let imageToken: String
+    public let imagePlaceholder: ImagePlaceholder
+
+    public init(
+        imageToken: String = "<image>", imagePlaceholder: ImagePlaceholder = .perImageWithNewline
+    ) {
         self.imageToken = imageToken
+        self.imagePlaceholder = imagePlaceholder
     }
 
     public func generate(from input: UserInput) -> [Message] {
@@ -458,14 +481,16 @@ public struct DeepseekOCRMessageGenerator: MessageGenerator {
         }
     }
 
-    /// mlx-vlm formats `deepseekocr` with `MessageFormat.IMAGE_TOKEN_NEWLINE`
-    /// (`prompt_utils.py`), whose token is `"<image>\n"` -- so every placeholder carries a
-    /// newline, and `prefix = token * num_images` is prepended to the user content. The
-    /// newline is a token in its own right, so omitting it shifts every position after the
-    /// lattice relative to the Python reference.
+    /// Prefixes the ``ImagePlaceholder`` shape to the user content. Content that already
+    /// spells its own placeholder is passed through untouched.
     public func generate(message: Chat.Message) -> Message {
-        let placeholders = String(
-            repeating: imageToken + "\n", count: message.images.count)
+        let placeholders: String
+        switch imagePlaceholder {
+        case .perImageWithNewline:
+            placeholders = String(repeating: imageToken + "\n", count: message.images.count)
+        case .single:
+            placeholders = message.images.isEmpty ? "" : imageToken
+        }
         var dictionary: Message = [
             "role": message.role.rawValue,
             "content":
@@ -556,10 +581,24 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
 
     private let config: DeepseekOCRProcessorConfiguration
     private let tokenizer: any Tokenizer
+    /// The placeholder shape this processor's prompts carry; chosen by the pack that
+    /// built it (see ``DeepseekOCRMessageGenerator/ImagePlaceholder``).
+    let imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder
 
+    /// DeepSeek-OCR's prompt shape. Kept as its own initializer, not a defaulted
+    /// parameter, because the processor registry binds `DeepseekOCRProcessor.init` as a
+    /// `(configuration, tokenizer)` function value, and defaults do not apply there.
     public init(_ config: DeepseekOCRProcessorConfiguration, tokenizer: any Tokenizer) {
+        self.init(config, tokenizer: tokenizer, imagePlaceholder: .perImageWithNewline)
+    }
+
+    public init(
+        _ config: DeepseekOCRProcessorConfiguration, tokenizer: any Tokenizer,
+        imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder
+    ) {
         self.config = config
         self.tokenizer = tokenizer
+        self.imagePlaceholder = imagePlaceholder
     }
 
     private func preprocess(image: CIImage, side: Int) -> MLXArray {
@@ -819,8 +858,9 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
     }
 
     private func chatTemplateTokens(for input: UserInput) throws -> [Int] {
-        let messages = DeepseekOCRMessageGenerator(imageToken: config.imageToken).generate(
-            from: input)
+        let messages = DeepseekOCRMessageGenerator(
+            imageToken: config.imageToken, imagePlaceholder: imagePlaceholder
+        ).generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages,
             tools: input.tools,

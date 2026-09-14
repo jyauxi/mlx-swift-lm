@@ -150,7 +150,7 @@ public enum VLMProcessorTypeRegistry {
         "DeepseekVLV2Processor": create(
             DeepseekOCRProcessorConfiguration.self, DeepseekOCRProcessor.init),
         "UnlimitedOCRProcessor": create(
-            UnlimitedOCRProcessorConfiguration.self, UnlimitedOCRProcessor.init),
+            UnlimitedOCRProcessorConfiguration.self, UnlimitedOCRProcessor.unlimited),
         "MuseGlimmerProcessor": create(
             MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
     ])

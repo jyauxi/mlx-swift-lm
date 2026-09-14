@@ -111,7 +111,10 @@ Unlimited-OCR (`model_type`: `unlimited-ocr` / `unlimited_ocr`) reuses the whole
 DeepSeek-OCR stack and swaps the decode cache for `RingSlidingKVCache` (R-SWA), so
 the KV cache stays constant-size no matter how long the output runs. Load it the
 same way, with `VLMRegistry.unlimitedOCR6bit` and its default prompt
-`"document parsing."`.
+`"document parsing."`. The prompt shape follows mlx-vlm's `model_type` keying:
+DeepSeek-OCR prefixes `<image>\n` once per image, Unlimited-OCR a single bare
+`<image>` whatever the page count. The processor the registry builds for each pack
+carries the right shape (`DeepseekOCRMessageGenerator.ImagePlaceholder`).
 
 > Note: these packs ship `model_type: deepseekocr` with
 > `_orig_model_type: unlimited-ocr` as a back-compat shim for loaders predating the

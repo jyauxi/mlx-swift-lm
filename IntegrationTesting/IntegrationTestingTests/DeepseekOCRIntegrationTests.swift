@@ -91,7 +91,9 @@ struct UnlimitedOCRTokenizerIntegrationTests {
         let input = UserInput(
             prompt: "document parsing.",
             images: [.url(URL(fileURLWithPath: "/dev/null"))])
-        let messages = DeepseekOCRMessageGenerator().generate(from: input)
+        // Unlimited's shape: mlx-vlm emits one bare `<image>` for `unlimited-ocr`.
+        let messages = DeepseekOCRMessageGenerator(imagePlaceholder: .single).generate(
+            from: input)
 
         let tokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: nil, additionalContext: nil)

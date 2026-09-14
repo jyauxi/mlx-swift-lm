@@ -21,13 +21,29 @@ public typealias UnlimitedOCRConfiguration = DeepseekOCRConfiguration
 /// `max_num=32` tiling, and multipage single-`<image>` support. Comparing the
 /// two processors tensor-by-tensor showed the single-page inference templates
 /// are identical, so a distinct Swift type would carry no behavior — hence a
-/// typealias rather than a subclass. Multipage fused prepare
-/// (`Multi page parsing.`, base mode) and optional `max_num=32` live on the
-/// shared processor: pass multiple `UserInput.Image`s and
-/// ``DeepseekOCRProcessor/modeContext(_:)`` `.base`, or
+/// typealias rather than a subclass. The one difference between the packs is
+/// the prompt's placeholder shape, which mlx-vlm decides outside the processor
+/// (`prompt_utils.py`, keyed on `model_type`);
+/// ``DeepseekOCRProcessor/unlimited(_:tokenizer:)``
+/// builds the shared processor with Unlimited's single bare `<image>`.
+/// Multipage fused prepare (`Multi page parsing.`, base mode) and optional
+/// `max_num=32` live on the shared processor: pass multiple `UserInput.Image`s
+/// and ``DeepseekOCRProcessor/modeContext(_:)`` `.base`, or
 /// ``DeepseekOCRProcessor/unlimitedContext(_:)`` for Unlimited tiling.
 public typealias UnlimitedOCRProcessorConfiguration = DeepseekOCRProcessorConfiguration
 public typealias UnlimitedOCRProcessor = DeepseekOCRProcessor
+
+extension DeepseekOCRProcessor {
+    /// The shared processor with Unlimited-OCR's prompt shape: one bare `<image>`
+    /// whatever the page count (mlx-vlm `MessageFormat.SINGLE_IMAGE_TOKEN` for
+    /// `unlimited-ocr`), fanned out to every page at prepare time. This is what
+    /// the `UnlimitedOCRProcessor` registry key constructs.
+    public static func unlimited(
+        _ config: UnlimitedOCRProcessorConfiguration, tokenizer: any Tokenizer
+    ) -> UnlimitedOCRProcessor {
+        UnlimitedOCRProcessor(config, tokenizer: tokenizer, imagePlaceholder: .single)
+    }
+}
 
 /// Unlimited-OCR VLM: DeepSeek-OCR weights + R-SWA decode cache.
 ///
