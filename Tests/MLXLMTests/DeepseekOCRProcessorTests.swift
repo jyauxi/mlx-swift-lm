@@ -375,10 +375,14 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         }
     }
 
-    /// Two pages through the Unlimited processor take the fused path: one placeholder,
-    /// both lattices, and no newline tokens — exactly two tokens fewer than the DeepSeek
-    /// shape renders for the same input.
-    func testUnlimitedProcessorFusesTwoPagesBehindOnePlaceholder() async throws {
+    /// `chatTemplateTokens` hands the processor's own `imagePlaceholder` to the message
+    /// generator, so the pack that built the processor decides the prompt shape. The spy
+    /// tokenizer sees the rendered prompt before the lattice fan-out, where a `.single`
+    /// processor spells two pages as exactly one `<image>` -- not `<image><image>`, which
+    /// the token-count deltas below could not tell apart from it. Those deltas then pin
+    /// that the choice survives to the prepared ids: exactly the two newline tokens the
+    /// DeepSeek shape carries and Unlimited's does not.
+    func testProcessorPassesItsPlaceholderToTheGenerator() async throws {
         let input = UserInput(
             prompt: "Multi page parsing.",
             images: [
@@ -387,9 +391,14 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             ],
             additionalContext: DeepseekOCRProcessor.modeContext(.base))
 
-        let unlimited = try await makeUnlimitedProcessor().internalPrepare(input: input)
+        let spy = PromptRecordingTokenizer()
+        let unlimited = try await makeUnlimitedProcessor(tokenizer: spy).internalPrepare(
+            input: input)
         let deepseek = try await makeProcessor().internalPrepare(input: input)
 
+        XCTAssertEqual(
+            spy.renderedContents.map { $0.components(separatedBy: "<image>").count - 1 }, [1],
+            "one template render, carrying exactly one <image> for two pages")
         XCTAssertEqual(unlimited.pixelValues.shape, [2, 3, 1024, 1024])
         XCTAssertEqual(unlimited.imagesSeqMask.asType(.int32).sum().item(Int.self), 546)
         XCTAssertEqual(
@@ -832,5 +841,36 @@ private struct DeterministicTokenizer: Tokenizer {
             }
         }
         return ids
+    }
+}
+
+/// `DeterministicTokenizer` that also records the message content each chat-template
+/// render was handed, so a test can see the prompt the processor built before the
+/// placeholder is fanned out to lattice positions.
+private final class PromptRecordingTokenizer: Tokenizer, @unchecked Sendable {
+    private let inner = DeterministicTokenizer()
+    private(set) var renderedContents = [String]()
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        inner.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        inner.decode(tokenIds: tokenIds, skipSpecialTokens: skipSpecialTokens)
+    }
+    func convertTokenToId(_ token: String) -> Int? { inner.convertTokenToId(token) }
+    func convertIdToToken(_ id: Int) -> String? { inner.convertIdToToken(id) }
+    var bosToken: String? { inner.bosToken }
+    var eosToken: String? { inner.eosToken }
+    var unknownToken: String? { inner.unknownToken }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        renderedContents.append(
+            contentsOf: messages.compactMap { $0["content"] as? String })
+        return try inner.applyChatTemplate(
+            messages: messages, tools: tools, additionalContext: additionalContext)
     }
 }
