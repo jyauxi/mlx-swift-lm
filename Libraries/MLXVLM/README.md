@@ -114,7 +114,9 @@ same way, with `VLMRegistry.unlimitedOCR6bit` and its default prompt
 `"document parsing."`. The prompt shape follows mlx-vlm's `model_type` keying:
 DeepSeek-OCR prefixes `<image>\n` once per image, Unlimited-OCR a single bare
 `<image>` whatever the page count. The processor the registry builds for each pack
-carries the right shape (`DeepseekOCRMessageGenerator.ImagePlaceholder`).
+carries the right shape: `DeepseekOCRProcessor`'s `imagePlaceholder:` parameter
+(a `DeepseekOCRMessageGenerator.ImagePlaceholder`) defaults to DeepSeek-OCR's
+`.perImageWithNewline`, and the `UnlimitedOCRProcessor` key passes `.single`.
 
 > Note: these packs ship `model_type: deepseekocr` with
 > `_orig_model_type: unlimited-ocr` as a back-compat shim for loaders predating the

@@ -637,7 +637,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         let config = try JSONDecoder().decode(
             UnlimitedOCRProcessorConfiguration.self,
             from: Data(Self.processorConfigJSON.utf8))
-        return DeepseekOCRProcessor.unlimited(config, tokenizer: tokenizer)
+        return DeepseekOCRProcessor(config, tokenizer: tokenizer, imagePlaceholder: .single)
     }
 
     private func makeSolidImage(width: CGFloat, height: CGFloat, color: CIColor) -> CIImage {

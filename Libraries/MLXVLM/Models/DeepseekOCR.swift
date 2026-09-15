@@ -583,18 +583,14 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
     private let tokenizer: any Tokenizer
     /// The placeholder shape this processor's prompts carry; chosen by the pack that
     /// built it (see ``DeepseekOCRMessageGenerator/ImagePlaceholder``).
-    let imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder
+    public let imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder
 
-    /// DeepSeek-OCR's prompt shape. Kept as its own initializer, not a defaulted
-    /// parameter, because the processor registry binds `DeepseekOCRProcessor.init` as a
-    /// `(configuration, tokenizer)` function value, and defaults do not apply there.
-    public init(_ config: DeepseekOCRProcessorConfiguration, tokenizer: any Tokenizer) {
-        self.init(config, tokenizer: tokenizer, imagePlaceholder: .perImageWithNewline)
-    }
-
+    /// - Parameter imagePlaceholder: the prompt's placeholder shape. Defaults to
+    ///   DeepSeek-OCR's `<image>\n` per image; the `UnlimitedOCRProcessor` registry key
+    ///   passes `.single` for Unlimited-OCR's one bare `<image>`.
     public init(
         _ config: DeepseekOCRProcessorConfiguration, tokenizer: any Tokenizer,
-        imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder
+        imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder = .perImageWithNewline
     ) {
         self.config = config
         self.tokenizer = tokenizer
