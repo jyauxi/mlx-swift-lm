@@ -446,7 +446,7 @@ public struct DeepseekOCRMessageGenerator: MessageGenerator {
 
     /// How image placeholders are prefixed to the user content.
     ///
-    /// mlx-vlm keys this on `model_type` (`prompt_utils.py`, `MODEL_FORMATS`): the two OCR
+    /// mlx-vlm keys this on `model_type` (`prompt_utils.py`, `MODEL_CONFIG`): the two OCR
     /// packs share a processor but not a prompt shape, and the difference is a token in
     /// its own right, so the wrong shape shifts every position after the image lattice
     /// relative to the Python reference.
