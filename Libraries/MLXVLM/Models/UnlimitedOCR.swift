@@ -14,6 +14,10 @@ import MLXLMCommon
 /// `unlimited_ocr`). Same JSON schema as DeepSeek-OCR plus R-SWA window fields.
 public typealias UnlimitedOCRConfiguration = DeepseekOCRConfiguration
 
+/// Processor configuration for Unlimited-OCR packs: the same
+/// `preprocessor_config.json` schema as DeepSeek-OCR.
+public typealias UnlimitedOCRProcessorConfiguration = DeepseekOCRProcessorConfiguration
+
 /// Processor for Unlimited-OCR.
 ///
 /// Python `processing_unlimitedocr.py` subclasses DeepseekOCRProcessor with
@@ -21,17 +25,17 @@ public typealias UnlimitedOCRConfiguration = DeepseekOCRConfiguration
 /// `max_num=32` tiling, and multipage single-`<image>` support. Comparing the
 /// two processors tensor-by-tensor showed the single-page inference templates
 /// are identical, so a distinct Swift type would carry no behavior — hence a
-/// typealias rather than a subclass. The one difference between the packs is
-/// the prompt's placeholder shape, which mlx-vlm decides outside the processor
-/// (`prompt_utils.py` `MODEL_CONFIG`, keyed on `model_type`); the
+/// typealias rather than a subclass. In this port's processors the packs differ
+/// only in the prompt's placeholder shape, which mlx-vlm decides outside the
+/// processor (`prompt_utils.py` `MODEL_CONFIG`, keyed on `model_type`); the
 /// `UnlimitedOCRProcessor` registry key builds the shared processor with
 /// ``DeepseekOCRProcessor/init(_:tokenizer:imagePlaceholder:)`` and `.single`,
 /// Unlimited's one bare `<image>`.
+///
 /// Multipage fused prepare (`Multi page parsing.`, base mode) and optional
 /// `max_num=32` live on the shared processor: pass multiple `UserInput.Image`s
 /// and ``DeepseekOCRProcessor/modeContext(_:)`` `.base`, or
 /// ``DeepseekOCRProcessor/unlimitedContext(_:)`` for Unlimited tiling.
-public typealias UnlimitedOCRProcessorConfiguration = DeepseekOCRProcessorConfiguration
 public typealias UnlimitedOCRProcessor = DeepseekOCRProcessor
 
 /// Unlimited-OCR VLM: DeepSeek-OCR weights + R-SWA decode cache.
