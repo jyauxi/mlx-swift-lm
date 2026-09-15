@@ -585,9 +585,12 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
     /// built it (see ``DeepseekOCRMessageGenerator/ImagePlaceholder``).
     public let imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder
 
-    /// - Parameter imagePlaceholder: the prompt's placeholder shape. Defaults to
-    ///   DeepSeek-OCR's `<image>\n` per image; the `UnlimitedOCRProcessor` registry key
-    ///   passes `.single` for Unlimited-OCR's one bare `<image>`.
+    /// - Parameters:
+    ///   - config: the pack's `preprocessor_config.json`.
+    ///   - tokenizer: the pack's tokenizer, which renders the chat template.
+    ///   - imagePlaceholder: the prompt's placeholder shape. Defaults to DeepSeek-OCR's
+    ///     `<image>\n` per image; the `UnlimitedOCRProcessor` registry key passes
+    ///     `.single` for Unlimited-OCR's one bare `<image>`.
     public init(
         _ config: DeepseekOCRProcessorConfiguration, tokenizer: any Tokenizer,
         imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder = .perImageWithNewline
