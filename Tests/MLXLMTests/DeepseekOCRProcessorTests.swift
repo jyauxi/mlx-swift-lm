@@ -410,9 +410,9 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         XCTAssertEqual(newlines(deepseek.inputIds) - newlines(unlimited.inputIds), 2)
     }
 
-    /// The registry default prompt lost a trailing space because the pack template
-    /// appends its own separator, so `"document parsing."` rendered a double space.
-    /// A stub that collapses whitespace cannot see that; this pins that it no longer does.
+    /// The registry default prompt carries no trailing space: the pack template appends
+    /// its own separator, so `"document parsing. "` renders a double space. A stub that
+    /// collapses whitespace cannot see that; this pins that the stub keeps the two apart.
     func testTrailingSpaceInThePromptChangesTheRenderedTemplate() throws {
         let tokenizer = DeterministicTokenizer(bosId: 7)
         let generator = DeepseekOCRMessageGenerator()
@@ -752,7 +752,7 @@ private struct DeterministicTokenizer: Tokenizer {
     /// swift-transformers encodes the rendered template with `addSpecialTokens: false`.
     var templateEmitsBOS = false
 
-    /// Emitted for each whitespace run so assertions can see separators.
+    /// Emitted once per whitespace character so assertions can see separators.
     static let whitespaceId = 900
 
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
@@ -763,14 +763,11 @@ private struct DeterministicTokenizer: Tokenizer {
         var remaining = text[...]
         while !remaining.isEmpty {
             if remaining.first?.isWhitespace == true {
-                // One id per whitespace run. The real SentencePiece tokenizer carries
-                // whitespace into its pieces; a stub that discards it cannot tell
-                // "document parsing." from "document parsing." and so cannot see a
-                // separator regression -- which is how the double-space bug survived.
-                // One id per whitespace CHARACTER, not per run: the bug this guards
-                // against is a doubled separator, and a run-collapsing stub encodes
-                // "parsing. " and "parsing.  " identically -- blind to exactly the
-                // difference that matters.
+                // One id per whitespace character. The real SentencePiece tokenizer
+                // carries whitespace into its pieces; a stub that discards it, or
+                // collapses a run to one id, encodes "parsing. " and "parsing.  "
+                // identically and so cannot see a doubled separator -- the exact
+                // difference this suite has to be able to see.
                 let run = remaining.prefix(while: \.isWhitespace)
                 ids.append(contentsOf: Array(repeating: Self.whitespaceId, count: run.count))
                 remaining = remaining.dropFirst(run.count)
