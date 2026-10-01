@@ -1090,6 +1090,109 @@ struct ToolTests {
         #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
     }
 
+    /// A tool whose parameters root is a discriminated union of two object branches.
+    private let unionTool: [[String: any Sendable]] = [
+        [
+            "function": [
+                "name": "submit",
+                "parameters": [
+                    "anyOf": [
+                        [
+                            "type": "object",
+                            "properties": [
+                                "mode": ["const": "extraction"],
+                                "extraction": [
+                                    "type": "object",
+                                    "properties": ["total": ["type": "integer"]],
+                                ] as [String: any Sendable],
+                                "count": ["type": "integer"],
+                                "note": ["type": "string"],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        [
+                            "type": "object",
+                            "properties": [
+                                "mode": ["const": "proposal"],
+                                "proposal": [
+                                    "type": "object",
+                                    "properties": ["name": ["type": "string"]],
+                                ] as [String: any Sendable],
+                                "count": ["type": "integer"],
+                                "note": ["type": "integer"],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ]
+                ] as [String: any Sendable],
+            ] as [String: any Sendable]
+        ]
+    ]
+
+    @Test("XML function parser reads parameter types through a union root")
+    func testXMLFunctionParserUnionRoot() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content = """
+            <function=submit>
+            <parameter=mode>
+            extraction
+            </parameter>
+            <parameter=extraction>
+            {"total": 4}
+            </parameter>
+            <parameter=count>
+            2
+            </parameter>
+            <parameter=note>
+            7
+            </parameter>
+            </function>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: unionTool))
+
+        #expect(toolCall.function.arguments["mode"] == .string("extraction"))
+        #expect(toolCall.function.arguments["extraction"] == .object(["total": .int(4)]))
+        #expect(toolCall.function.arguments["count"] == .int(2))
+        // Branches disagree on the type, so the text is kept.
+        #expect(toolCall.function.arguments["note"] == .string("7"))
+    }
+
+    @Test("Qwen 3.5 parser reads a union root's nested payload as an object")
+    func testQwen35ParserUnionRoot() throws {
+        let processor = ToolCallProcessor(format: .qwen35, tools: unionTool)
+        let content = """
+            <tool_call>
+            <function=submit>
+            <parameter=mode>
+            proposal
+            </parameter>
+            <parameter=proposal>
+            {"name": "invoice"}
+            </parameter>
+            </function>
+            </tool_call>
+            """
+
+        _ = processor.processChunk(content)
+        processor.processEOS()
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.arguments["mode"] == .string("proposal"))
+        #expect(toolCall.function.arguments["proposal"] == .object(["name": .string("invoice")]))
+    }
+
+    @Test("MiniMax M2 parser reads parameter types through a union root")
+    func testMiniMaxM2ParserUnionRoot() throws {
+        let parser = MiniMaxM2ToolCallParser()
+        let content =
+            "<minimax:tool_call><invoke name=\"submit\"><parameter name=\"mode\">extraction</parameter><parameter name=\"extraction\">{\"total\": 4}</parameter></invoke></minimax:tool_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: unionTool))
+
+        #expect(toolCall.function.arguments["mode"] == .string("extraction"))
+        #expect(toolCall.function.arguments["extraction"] == .object(["total": .int(4)]))
+    }
+
     // MARK: - Qwen3.5 Format Tests (XML Function with tool_call wrapper)
 
     @Test("Test Qwen3.5 XML Function Parser - With tool_call Tags")
