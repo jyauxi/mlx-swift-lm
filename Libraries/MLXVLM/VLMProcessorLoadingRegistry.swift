@@ -75,6 +75,7 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
             "gemma4_unified": "Gemma4UnifiedProcessor",
             "unlimited-ocr": "UnlimitedOCRProcessor",
             "unlimited_ocr": "UnlimitedOCRProcessor",
+            "diffusion_gemma": "DiffusionGemma4Processor",
         ]),
     ])
 

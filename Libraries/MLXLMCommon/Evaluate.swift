@@ -42,6 +42,12 @@ public protocol LogitProcessor {
     /// Called to provide the sampled token
     mutating func didSample(token: MLXArray)
 
+    /// Called when a sampled token is emitted by the generation stream.
+    mutating func didEmit(token: Int)
+
+    /// Called after the generation stream has emitted its last token.
+    mutating func finalizeGeneration()
+
     /// Returns an independent copy of this processor.
     ///
     /// Value types (structs) obtain an independent copy via standard value semantics
@@ -54,6 +60,10 @@ extension LogitProcessor {
     public func copy() -> Self {
         self
     }
+
+    public mutating func didEmit(token: Int) {}
+
+    public mutating func finalizeGeneration() {}
 }
 
 extension LogitProcessor where Self: AnyObject {
@@ -65,6 +75,44 @@ extension LogitProcessor where Self: AnyObject {
             in speculative decoding and verification passes.
             """
         )
+    }
+}
+
+/// The log probability assigned to one vocabulary token.
+public struct GenerateTokenLogProbability: Sendable, Equatable {
+    /// The vocabulary token ID.
+    public let token: Int
+
+    /// The token's log probability after logit processing and before sampling.
+    public let logProbability: Float
+
+    public init(token: Int, logProbability: Float) {
+        self.token = token
+        self.logProbability = logProbability
+    }
+}
+
+/// Log-probability details for one generated token.
+///
+/// These values match Python MLX-LM's `GenerationResponse.logprobs`: they
+/// normalize the post-processor logits before temperature or sampler filters
+/// are applied.
+public struct GenerateTokenLogProbabilities: Sendable, Equatable {
+    /// The token selected by the sampler and its log probability.
+    public let chosen: GenerateTokenLogProbability
+
+    /// The most likely vocabulary tokens in descending log-probability order.
+    ///
+    /// This can include ``chosen`` when the selected token is among the requested
+    /// top candidates.
+    public let topLogProbabilities: [GenerateTokenLogProbability]
+
+    public init(
+        chosen: GenerateTokenLogProbability,
+        topLogProbabilities: [GenerateTokenLogProbability] = []
+    ) {
+        self.chosen = chosen
+        self.topLogProbabilities = topLogProbabilities
     }
 }
 
@@ -160,11 +208,18 @@ public struct GenerateParameters: Sendable {
     /// Min-p sampling threshold relative to the highest probability token (0 disables)
     public var minP: Float
 
+    /// Per-token log-probability reporting. `nil` disables reporting; `0` reports
+    /// the selected token only, and a positive value also reports that many top tokens.
+    /// Use ``LogProbabilityTokenLoopHandler`` to emit these values through a custom generation loop.
+    /// Speculative iterators report the verifier's values for each emitted token.
+    public var logProbabilities: Int?
+
     /// Optional seed for reproducible sampling. When set, the sampler's RNG
     /// (`TopPSampler` / `CategoricalSampler`) is seeded deterministically, so
     /// the same `(seed, prompt, parameters)` produces the same sampled
     /// tokens. `nil` ⇒ the sampler is seeded from system entropy (the prior
-    /// default). Inert at `temperature == 0` (argmax has no RNG).
+    /// default). Inert for autoregressive generation at `temperature == 0`;
+    /// block diffusion still uses it to initialize denoising canvases.
     public var seed: UInt64?
 
     /// Penalty factor for repeating tokens
@@ -185,7 +240,64 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Recovery and validation rules for generated tool calls.
+    public var toolCallPolicy: ToolCallPolicy
+
+    /// Request-level controls for block-diffusion generation.
+    public var diffusion: BlockDiffusionParameters = .init()
+
     public init(
+        maxTokens: Int? = nil,
+        maxKVSize: Int? = nil,
+        kvCache: KVCacheConfiguration? = nil,
+        kvBits: Int? = nil,
+        kvGroupSize: Int = 64,
+        quantizedKVStart: Int = 0,
+        kvScheme: String? = nil,
+        temperature: Float = 0.6,
+        topP: Float = 1.0,
+        topK: Int = 0,
+        minP: Float = 0.0,
+        logProbabilities: Int? = nil,
+        repetitionPenalty: Float? = nil,
+        repetitionContextSize: Int = 20,
+        presencePenalty: Float? = nil,
+        presenceContextSize: Int = 20,
+        frequencyPenalty: Float? = nil,
+        frequencyContextSize: Int = 20,
+        prefill: PrefillParameters = .init(),
+        seed: UInt64? = nil,
+        toolCallPolicy: ToolCallPolicy = .init()
+    ) {
+        self.maxTokens = maxTokens
+        self.maxKVSize = maxKVSize
+        self.kvCache = kvCache
+        self.kvBits = kvBits
+        self.kvGroupSize = kvGroupSize
+        self.quantizedKVStart = quantizedKVStart
+        self.kvScheme = kvScheme
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.logProbabilities = logProbabilities
+        self.repetitionPenalty = repetitionPenalty
+        self.repetitionContextSize = repetitionContextSize
+        self.presencePenalty = presencePenalty
+        self.presenceContextSize = presenceContextSize
+        self.frequencyPenalty = frequencyPenalty
+        self.frequencyContextSize = frequencyContextSize
+        self.prefill = prefill
+        self.seed = seed
+        self.toolCallPolicy = toolCallPolicy
+    }
+
+    /// Creates generation parameters with request-level block-diffusion controls.
+    ///
+    /// The overload without `diffusion` retains its original public signature
+    /// for existing clients and initializes these controls to their defaults.
+    public init(
+        diffusion: BlockDiffusionParameters,
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
         kvCache: KVCacheConfiguration? = nil,
@@ -206,25 +318,27 @@ public struct GenerateParameters: Sendable {
         prefill: PrefillParameters = .init(),
         seed: UInt64? = nil
     ) {
-        self.maxTokens = maxTokens
-        self.maxKVSize = maxKVSize
-        self.kvCache = kvCache
-        self.kvBits = kvBits
-        self.kvGroupSize = kvGroupSize
-        self.quantizedKVStart = quantizedKVStart
-        self.kvScheme = kvScheme
-        self.temperature = temperature
-        self.topP = topP
-        self.topK = topK
-        self.minP = minP
-        self.repetitionPenalty = repetitionPenalty
-        self.repetitionContextSize = repetitionContextSize
-        self.presencePenalty = presencePenalty
-        self.presenceContextSize = presenceContextSize
-        self.frequencyPenalty = frequencyPenalty
-        self.frequencyContextSize = frequencyContextSize
-        self.prefill = prefill
-        self.seed = seed
+        self.init(
+            maxTokens: maxTokens,
+            maxKVSize: maxKVSize,
+            kvCache: kvCache,
+            kvBits: kvBits,
+            kvGroupSize: kvGroupSize,
+            quantizedKVStart: quantizedKVStart,
+            kvScheme: kvScheme,
+            temperature: temperature,
+            topP: topP,
+            topK: topK,
+            minP: minP,
+            repetitionPenalty: repetitionPenalty,
+            repetitionContextSize: repetitionContextSize,
+            presencePenalty: presencePenalty,
+            presenceContextSize: presenceContextSize,
+            frequencyPenalty: frequencyPenalty,
+            frequencyContextSize: frequencyContextSize,
+            prefill: prefill,
+            seed: seed)
+        self.diffusion = diffusion
     }
 
     @available(
@@ -322,6 +436,37 @@ public struct GenerateParameters: Sendable {
     }
 }
 
+/// Errors raised by generation helpers before starting an invalid decode mode.
+public enum GenerateError: LocalizedError {
+    case unsupportedAutoregressiveGeneration(String)
+    case unsupportedSpeculativeDecoding(String)
+    case unsupportedMultimodalGeneration(String)
+    case unsupportedBatchSize(modelName: String, batchSize: Int)
+    case invalidAttentionMask(String)
+    case invalidDiffusionConfiguration(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedAutoregressiveGeneration(let modelName):
+            return
+                "\(modelName) is a block-diffusion model and cannot be decoded with autoregressive next-token generation."
+        case .unsupportedSpeculativeDecoding(let modelName):
+            return
+                "Speculative decoding is only supported for autoregressive language models; \(modelName) generates tokens with block diffusion."
+        case .unsupportedMultimodalGeneration(let modelName):
+            return
+                "\(modelName) is the shared DiffusionGemma language core. Use the VLM implementation for image, video, or audio inputs."
+        case .unsupportedBatchSize(let modelName, let batchSize):
+            return
+                "\(modelName) block-diffusion streaming supports batch size 1, but received batch size \(batchSize)."
+        case .invalidAttentionMask(let reason):
+            return "Invalid block-diffusion attention mask: \(reason)"
+        case .invalidDiffusionConfiguration(let reason):
+            return "Invalid block-diffusion configuration: \(reason)"
+        }
+    }
+}
+
 /// Sampler that uses `argMax` (most likely) to sample the logits.
 public struct ArgMaxSampler: LogitSampler {
     public init() {}
@@ -370,8 +515,12 @@ public struct TopPSampler: LogitSampler {
             logits = logits.asType(.float32)
         }
 
-        return withRandomState(randomState) {
-            var logprobs = logSoftmax(logits)
+        return sample(logProbabilities: logSoftmax(logits))
+    }
+
+    fileprivate func sample(logProbabilities: MLXArray) -> MLXArray {
+        withRandomState(randomState) {
+            var logprobs = logProbabilities
 
             // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
             if let topP {
@@ -480,23 +629,27 @@ struct TokenRing {
     }
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
+    ///
+    /// Image sentinels (such as FastVLM's -200) are not vocabulary IDs, so they are
+    /// skipped. The prompt is read back to front, only as far as it takes to find
+    /// `capacity` tokens.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let promptTokens = prompt.asType(.int32).flattened()
-        let n = promptTokens.count
-        if n <= capacity {
-            if n < capacity {
-                let padding = MLXArray.zeros([capacity - n], type: Int32.self)
-                buffer = concatenated([promptTokens, padding])
-            } else {
-                buffer = promptTokens
-            }
-            count = n
-            writeIndex = n % capacity
-        } else {
-            buffer = promptTokens[(-capacity)...]
-            count = capacity
-            writeIndex = 0
+        let prompt = prompt.flattened()
+        var tokens = [Int32]()
+        var end = prompt.size
+        var length = capacity
+        while tokens.count < capacity, end > 0 {
+            let start = max(0, end - length)
+            // Converting on the CPU skips a GPU round trip for a handful of tokens.
+            let chunk = prompt[start ..< end].asType(.int32, stream: .cpu)
+            tokens = chunk.asArray(Int32.self).filter { $0 >= 0 } + tokens
+            end = start
+            length *= 2
         }
+        let kept = tokens.suffix(capacity)
+        buffer = MLXArray(Array(kept) + [Int32](repeating: 0, count: capacity - kept.count))
+        count = kept.count
+        writeIndex = count % capacity
     }
 
     /// Append a single token using GPU-only mask write (no CPU←GPU sync).
@@ -670,6 +823,31 @@ public struct ChainedLogitProcessor: LogitProcessor {
             processors[index].didSample(token: token)
         }
     }
+
+    mutating public func didEmit(token: Int) {
+        for index in processors.indices {
+            processors[index].didEmit(token: token)
+        }
+    }
+
+    mutating public func finalizeGeneration() {
+        for index in processors.indices {
+            processors[index].finalizeGeneration()
+        }
+    }
+}
+
+package protocol GenerationReasoningTokenCounting {
+    var generationReasoningTokenCount: Int? { get }
+}
+
+extension ChainedLogitProcessor: GenerationReasoningTokenCounting {
+    package var generationReasoningTokenCount: Int? {
+        processors.lazy.compactMap {
+            ($0 as? any GenerationReasoningTokenCounting)?.generationReasoningTokenCount
+        }
+        .first
+    }
 }
 
 /// Common properties shared by token-generating iterators.
@@ -679,6 +857,12 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var promptPrefillTime: TimeInterval { get }
     var state: LMOutput.State? { get }
     var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { get }
+    var lastLogProbabilities: DeferredTokenLogProbabilities? { get }
+    var evictedTokenCount: Int { get }
+    var reasoningTokenCount: Int? { get }
+
+    /// Records a token included in the generated completion.
+    mutating func recordEmittedToken(_ token: Int)
     mutating func discardGeneratedToken()
 }
 
@@ -691,7 +875,137 @@ protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
 extension TokenIteratorProtocol {
     public var state: LMOutput.State? { nil }
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { nil }
+    public var lastLogProbabilities: DeferredTokenLogProbabilities? { nil }
+    public var evictedTokenCount: Int { 0 }
+    public var reasoningTokenCount: Int? { nil }
+    public mutating func recordEmittedToken(_ token: Int) {}
     public mutating func discardGeneratedToken() {}
+}
+
+/// Normalized logits shared by reporting and filtered sampling.
+private struct LogProbabilityDistribution {
+    let values: MLXArray
+
+    init(logits: MLXArray) {
+        var logits = logits
+        if logits.dtype == .bfloat16 {
+            logits = logits.asType(.float32)
+        }
+        self.values = logSoftmax(logits)
+    }
+
+    func recording(token: MLXArray, topK: Int) -> DeferredTokenLogProbabilities {
+        DeferredTokenLogProbabilities(logProbabilities: values, token: token, topK: topK)
+    }
+}
+
+/// Log probabilities for one generated token that are still on the GPU.
+///
+/// ``TokenIterator`` evaluates them with the decode step that samples the token.
+/// Handlers that ignore them skip the GPU-to-host copy. MLX arrays are not
+/// `Sendable`, so call ``materialize()`` on the generation worker and send the result.
+public struct DeferredTokenLogProbabilities {
+    let token: MLXArray
+    let chosenLogProbability: MLXArray
+    let topTokenIDs: MLXArray?
+    let topLogProbabilities: MLXArray?
+
+    init(logProbabilities: MLXArray, token: MLXArray, topK: Int) {
+        self.token = token
+        // Cast to the read types in the graph: a cast at read time is new GPU
+        // work that waits behind the decode step already in flight.
+        let tokenIndices = token[0..., .newAxis]
+        self.chosenLogProbability = takeAlong(logProbabilities, tokenIndices, axis: -1)
+            .asType(.float32)
+
+        let count = Swift.min(Swift.max(topK, 0), logProbabilities.dim(-1))
+        guard count > 0 else {
+            self.topTokenIDs = nil
+            self.topLogProbabilities = nil
+            return
+        }
+
+        let unorderedTokenIDs: MLXArray
+        if count == logProbabilities.dim(-1) {
+            unorderedTokenIDs = argSort(-logProbabilities, axis: -1)
+        } else {
+            unorderedTokenIDs =
+                argPartition(
+                    -logProbabilities, kth: count - 1, axis: -1)[.ellipsis, ..<count]
+        }
+        let unorderedLogProbabilities = takeAlong(
+            logProbabilities, unorderedTokenIDs, axis: -1)
+        let order = argSort(-unorderedLogProbabilities, axis: -1)
+        self.topTokenIDs = takeAlong(unorderedTokenIDs, order, axis: -1).asType(.int32)
+        self.topLogProbabilities = takeAlong(unorderedLogProbabilities, order, axis: -1)
+            .asType(.float32)
+    }
+
+    private init(
+        token: MLXArray, chosenLogProbability: MLXArray,
+        topTokenIDs: MLXArray?, topLogProbabilities: MLXArray?
+    ) {
+        self.token = token
+        self.chosenLogProbability = chosenLogProbability
+        self.topTokenIDs = topTokenIDs
+        self.topLogProbabilities = topLogProbabilities
+    }
+
+    /// Records the log probabilities of tokens sampled from the rows of processed logits.
+    ///
+    /// One batch serves every row and evaluates in the background, so a speculative round
+    /// pays one normalization for the tokens it emits, outside its accept loop.
+    ///
+    /// - Parameters:
+    ///   - tokens: The sampled tokens, in emission order, one or more per array.
+    ///   - logits: The processed logits each token was sampled from, one row per token.
+    ///   - topK: The candidates to report per token; `nil` records nothing.
+    /// - Returns: One value per token, or none when `topK` is `nil`.
+    static func recording(
+        _ tokens: [MLXArray], sampledFrom logits: [MLXArray], topK: Int?
+    ) -> [DeferredTokenLogProbabilities] {
+        guard let topK, !tokens.isEmpty else { return [] }
+        let tokens = concatenated(tokens.map { $0.flattened() })
+        let batch = LogProbabilityDistribution(
+            logits: concatenated(logits.map { $0.reshaped(-1, $0.dim(-1)) })
+        ).recording(token: tokens, topK: topK)
+        let rows = (0 ..< tokens.dim(0)).map { row in
+            DeferredTokenLogProbabilities(
+                token: batch.token[row ..< row + 1],
+                chosenLogProbability: batch.chosenLogProbability[row ..< row + 1],
+                topTokenIDs: batch.topTokenIDs?[row ..< row + 1],
+                topLogProbabilities: batch.topLogProbabilities?[row ..< row + 1])
+        }
+        // Evaluate the row views too: each unevaluated view read later is a GPU sync.
+        asyncEval(rows.flatMap { [$0.token] + $0.arrays })
+        return rows
+    }
+
+    var arrays: [MLXArray] {
+        [chosenLogProbability, topTokenIDs, topLogProbabilities].compactMap { $0 }
+    }
+
+    /// Copies the values from the GPU into a `Sendable` value.
+    public func materialize() -> GenerateTokenLogProbabilities {
+        let materializedTopLogProbabilities: [GenerateTokenLogProbability]
+        if let topTokenIDs, let topLogProbabilityValues = topLogProbabilities {
+            materializedTopLogProbabilities = zip(
+                topTokenIDs.asArray(Int32.self),
+                topLogProbabilityValues.asArray(Float.self)
+            )
+            .map { token, logProbability in
+                GenerateTokenLogProbability(token: Int(token), logProbability: logProbability)
+            }
+        } else {
+            materializedTopLogProbabilities = []
+        }
+
+        return GenerateTokenLogProbabilities(
+            chosen: .init(
+                token: token.item(Int.self),
+                logProbability: chosenLogProbability.item(Float.self)),
+            topLogProbabilities: materializedTopLogProbabilities)
+    }
 }
 
 /// Generator of tokens.
@@ -723,8 +1037,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Per-call model state (e.g. M-RoPE rope deltas), seeded from the
     /// initializer's `state`, replaced by prefill, then threaded through
     /// every decode step. A caller continuing this cache later (as
-    /// ``ChatSession`` does across turns) reads it back after
-    /// initialization and seeds the next iterator with it.
+    /// ``ChatSession`` does across turns) reads it back after generation
+    /// and seeds the next iterator with it.
     public internal(set) var state: LMOutput.State?
 
     var y: LMInput.Text
@@ -735,9 +1049,22 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
     var processor: LogitProcessor?
     let sampler: LogitSampler
+    let logProbabilityTopK: Int?
+    private var deferredLogProbabilities: DeferredTokenLogProbabilities?
+
+    /// Log probabilities for the token returned by the most recent ``next()`` call.
+    public private(set) var lastLogProbabilities: DeferredTokenLogProbabilities?
 
     public var tokenCount = 0
     public let maxTokens: Int?
+
+    public var evictedTokenCount: Int {
+        KVCacheTree.leaves(in: cache).map(\.cache.evictedTokenCount).max() ?? 0
+    }
+
+    public var reasoningTokenCount: Int? {
+        (processor as? any GenerationReasoningTokenCounting)?.generationReasoningTokenCount
+    }
 
     var kvCachePlan: KVCachePlan { cacheStorage.plan }
 
@@ -810,8 +1137,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cacheStorage = cacheStorage
 
         try components.validate(parameters: parameters)
-        self.processor = components.logitProcessor(parameters: parameters)
+        self.processor = components.logitProcessor(parameters: parameters, model: model)
         self.sampler = parameters.sampler()
+        self.logProbabilityTopK = parameters.logProbabilities.map { Swift.max($0, 0) }
         self.maxTokens = parameters.maxTokens
 
         self.promptPrefillTime = try measure {
@@ -846,6 +1174,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.processor = processor
         self.sampler = sampler
+        self.logProbabilityTopK = nil
         self.maxTokens = maxTokens
 
         self.promptPrefillTime = try measure {
@@ -873,6 +1202,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
         processor?.prompt(input.text.tokens)
+        prefill.prefix?(cacheStorage.processedTokenCount)
         let inputLength = input.text.cacheSequenceLength
 
         switch try model.prepare(input, cache: cache, state: state, prefill: prefill) {
@@ -887,7 +1217,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             // evaluate the remainder of the prompt -- this primes the pump
             let token = step(previous: y)
             y = .init(tokens: token)
-            asyncEval(y.tokens)
+            evaluateTokenAndLogProbabilities(y.tokens)
 
             // the model reported per-chunk progress; the remainder it left to us
             // completes the prompt (models returning .logits report their own terminal)
@@ -899,7 +1229,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             // carry the prefill state into decode, as step(previous:) does for later steps
             self.state = result.state
             y = .init(tokens: convertToToken(logits: result.logits))
-            asyncEval(y.tokens)
+            evaluateTokenAndLogProbabilities(y.tokens)
 
             break
         }
@@ -912,18 +1242,40 @@ public struct TokenIterator: TokenIteratorProtocol {
         var logits = logits[0..., -1, 0...]
         logits = processor?.process(logits: logits) ?? logits
 
-        // transform logits back to a token
-        let y = sampler.sample(logits: logits)
+        // Filtered sampling already normalizes logits, so reuse that distribution.
+        let y: MLXArray
+        if let logProbabilityTopK {
+            let distribution = LogProbabilityDistribution(logits: logits)
+            if let sampler = sampler as? TopPSampler {
+                y = sampler.sample(logProbabilities: distribution.values)
+            } else {
+                y = sampler.sample(logits: logits)
+            }
+            self.deferredLogProbabilities = distribution.recording(
+                token: y, topK: logProbabilityTopK)
+        } else {
+            self.deferredLogProbabilities = nil
+            y = sampler.sample(logits: logits)
+        }
 
         processor?.didSample(token: y)
 
         return y
     }
 
+    private func evaluateTokenAndLogProbabilities(_ token: MLXArray) {
+        if let deferredLogProbabilities {
+            asyncEval([token] + deferredLogProbabilities.arrays)
+        } else {
+            asyncEval(token)
+        }
+    }
+
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
         let result = withPreparedCache(cache, lengths: previous.sequenceLengths) {
-            model(previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+            model.nextTokenLogits(
+                previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         }
         cacheStorage.commitProcessedTokens(previous.cacheSequenceLength)
         self.state = result.state
@@ -946,6 +1298,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         return autoreleasepool {
             // save current value -- this will be returned
             let previousY = y
+            let previousLogProbabilities = deferredLogProbabilities
 
             // compute the next state and async eval the next token
             let token = step(previous: previousY)
@@ -955,25 +1308,40 @@ public struct TokenIterator: TokenIteratorProtocol {
             // unevaluated chain of those updates keeps every prior step's
             // intermediates alive. Python mlx-lm settles cache state the same
             // way in its generation loop.
-            asyncEval([token] + cache.flatMap { $0.state })
-
-            tokenCount += 1
+            if let deferredLogProbabilities {
+                asyncEval([token] + cache.flatMap { $0.state } + deferredLogProbabilities.arrays)
+            } else {
+                asyncEval([token] + cache.flatMap { $0.state })
+            }
 
             // Periodically return freed buffers that cannot be reused (odd or
             // monotonically growing sizes accumulate in the pool otherwise).
-            // Matches mlx-lm's clear cadence.
+            // Matches mlx-lm, which also clears on the first token, after prefill.
             if tokenCount % 256 == 0 {
                 MLX.Memory.clearCache()
             }
 
+            tokenCount += 1
+
+            lastLogProbabilities = previousLogProbabilities
             return previousY.tokens.item(Int.self)
         }
+    }
+
+    public mutating func recordEmittedToken(_ token: Int) {
+        processor?.didEmit(token: token)
+    }
+}
+
+extension TokenIterator: GenerationFinalizingTokenIterator {
+    mutating func finalizeGeneration() {
+        processor?.finalizeGeneration()
     }
 }
 
 /// Generator of tokens using speculative decoding.
 ///
-/// This is typically used via a call to ``generate(input:cache:state:parameters:context:draftModel:draftCache:numDraftTokens:components:wiredMemoryTicket:)``
+/// This is typically used via a call to ``generate(input:cache:state:parameters:context:draftModel:draftCache:numDraftTokens:components:wiredMemoryTicket:tools:)``
 /// returning `AsyncStream<Generation>`.
 ///
 /// To use it directly:
@@ -1028,6 +1396,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
+    let logProbabilityTopK: Int?
+
+    /// Log probabilities for the token returned by the most recent ``next()`` call.
+    public private(set) var lastLogProbabilities: DeferredTokenLogProbabilities?
 
     public var tokenCount: Int { telemetry.emittedTokenCount }
     public let maxTokens: Int?
@@ -1035,6 +1407,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
     // Buffer of accepted tokens from the current speculation round
     private var pendingTokens = [Int]()
+    /// The verifier's log probabilities for `pendingTokens`, when requested.
+    private var pendingLogProbabilities = [DeferredTokenLogProbabilities]()
     private var pendingIndex = 0
     /// Pending tokens already represented by each cache. The final token in a
     /// speculative round is sampled from the verifier logits but is not fed
@@ -1042,11 +1416,28 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     private var mainCommittedPendingTokenCount = 0
     private var draftCommittedPendingTokenCount = 0
 
+    /// Why speculation stopped and the rest of the stream decodes one token at a time, or `nil`
+    /// while rounds are still speculative. Engaged when a cache can neither stage nor trim a
+    /// round: generation stays correct, it just stops speculating.
+    private(set) var passthroughReason: String?
+
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
     private var telemetry = SpeculativeDecodingTelemetry()
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? {
         telemetry.roundCount > 0 ? telemetry : nil
+    }
+
+    public var evictedTokenCount: Int {
+        KVCacheTree.leaves(in: mainCache).map(\.cache.evictedTokenCount).max() ?? 0
+    }
+
+    public var reasoningTokenCount: Int? {
+        (processor as? any GenerationReasoningTokenCounting)?.generationReasoningTokenCount
+    }
+
+    public mutating func recordEmittedToken(_ token: Int) {
+        processor?.didEmit(token: token)
     }
 
     public mutating func discardGeneratedToken() {
@@ -1076,6 +1467,15 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         numDraftTokens: Int,
         components: GenerationComponents = .init()
     ) throws {
+        guard !mainModel.capabilities.contains(.blockDiffusion) else {
+            throw GenerateError.unsupportedSpeculativeDecoding(
+                String(describing: type(of: mainModel)))
+        }
+        guard !draftModel.capabilities.contains(.blockDiffusion) else {
+            throw GenerateError.unsupportedSpeculativeDecoding(
+                String(describing: type(of: draftModel)))
+        }
+
         let plan = try parameters.kvCachePlan()
         try self.init(
             input: input, mainModel: mainModel, draftModel: draftModel,
@@ -1109,11 +1509,24 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             throw KVCacheError(
                 message: "Speculative caches must represent the same processed-token position.")
         }
-        guard
-            canTrimPromptCache(mainCacheStorage.cache),
-            canTrimPromptCache(draftCacheStorage.cache)
-        else {
-            throw KVCacheError(message: "Speculative decoding requires trimmable KV caches.")
+        guard canTrimPromptCache(draftCacheStorage.cache) else {
+            throw KVCacheError(
+                message: "Speculative decoding requires a trimmable draft KV cache.")
+        }
+        // The main cache rewinds rejected drafts by trimming, or through a staged round once a
+        // rotating cache has wrapped and stopped being trimmable. Probe with a round at the
+        // width rounds will use, as `MTPSpeculativeTokenIterator` does, so this check cannot
+        // drift from the leaf classification.
+        if !canTrimPromptCache(mainCacheStorage.cache) {
+            guard
+                let probe = mainCacheStorage.beginRound(
+                    maximumPositions: numDraftTokens + 1)
+            else {
+                throw KVCacheError(
+                    message:
+                        "Speculative decoding requires a trimmable or stageable main KV cache.")
+            }
+            mainCacheStorage.rollback(probe)
         }
 
         self.y = input.text
@@ -1126,8 +1539,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.state = mainState
 
         self.sampler = parameters.sampler()
+        self.logProbabilityTopK = parameters.logProbabilities.map { Swift.max($0, 0) }
         try components.validate(parameters: parameters)
-        self.processor = components.logitProcessor(parameters: parameters)
+        self.processor = components.logitProcessor(parameters: parameters, model: mainModel)
 
         self.maxTokens = parameters.maxTokens
         self.numDraftTokens = numDraftTokens
@@ -1140,6 +1554,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     /// Prefill both main and draft models with the prompt, priming caches for generation
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
         processor?.prompt(input.text.tokens)
+        prefill.prefix?(mainCacheStorage.processedTokenCount)
         let inputLength = input.text.cacheSequenceLength
 
         // Prefill main model
@@ -1165,6 +1580,11 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: token)
             y = .init(tokens: token)
             state = result.state
+            // The verify pass only emits tokens *after* `y`, so the
+            // prefill-sampled token must be queued here or the stream would
+            // silently start at the second generated token.
+            pendingTokens.append(token.item(Int.self))
+            recordLogProbabilities(of: [token], sampledFrom: [logits])
         }
 
         // Prefill draft model, don't call didSample here -- processor tracks main model's accepted sequence only
@@ -1201,6 +1621,30 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         guard numDraft > 0 else {
             return
         }
+        guard passthroughReason == nil else {
+            plainRound()
+            return
+        }
+
+        // Rewinding must be possible *before* anything is written. A staged round commits only
+        // the accepted rows, so it stays exact after a rotating cache wraps and can no longer
+        // trim; with no round available, fall back to trim only while every leaf can still take
+        // back the width. After a `.tokens`-returning `prepare`, `y` is the whole remaining
+        // prompt, so the width comes from `y` rather than from `numDraft` alone.
+        let ySize = y.cacheSequenceLength
+        let roundWidth = ySize + numDraft
+        // A cache-less model has nothing to stage or rewind: an empty round
+        // would report zero written positions and refuse any commit.
+        let round =
+            mainCache.isEmpty
+            ? nil : mainCacheStorage.beginRound(maximumPositions: roundWidth)
+        if round == nil,
+            !mainCache.allSatisfy({ $0.isTrimmable(after: roundWidth) })
+        {
+            passthroughReason = "main KV cache can neither stage nor trim a speculative round"
+            plainRound()
+            return
+        }
 
         // Draft generation: autoregressive loop with draft model
         var draftProcessor = processor?.copy()  // Copy to discard later
@@ -1220,30 +1664,39 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             draftY = .init(tokens: draftToken)
         }
 
-        // Verification: main model processes proposals in one pass
+        // Verification: main model processes proposals in one pass. With a
+        // staged round the model runs against the round's presented caches;
+        // the live entries stay untouched until the commit below.
         let verifyTokens = [y.tokens] + draftTokens
         let verifyInput = LMInput.Text(tokens: concatenated(verifyTokens))
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
-        let mainResult = mainModel(verifyInput[text: .newAxis], cache: mainCache, state: state)
-        mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
+        let mainResult = mainModel(
+            verifyInput[text: .newAxis], cache: round?.caches ?? mainCache, state: state)
+        if round == nil {
+            mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
+        }
         let mainLogits = mainResult.logits
         state = mainResult.state
 
         let mainTokens: MLXArray
+        let verifyLogits: MLXArray
         if var verifyProcessor = processor?.copy() {
             // Process each position sequentially so that the processor sees tokens sampled at earlier positions
             var sampled = [MLXArray]()
+            var processed = [MLXArray]()
             for i in 0 ..< (numDraft + 1) {
                 var logits = mainLogits[0..., verifyStart + i, 0...]
                 logits = verifyProcessor.process(logits: logits)
                 let token = sampler.sample(logits: logits)
                 verifyProcessor.didSample(token: token)
                 sampled.append(token)
+                processed.append(logits)
             }
             mainTokens = concatenated(sampled)
+            verifyLogits = concatenated(processed)
         } else {
             // Batch-sample all verify tokens from main model in one operation
-            let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
+            verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
             mainTokens = sampler.sample(logits: verifyLogits)
         }
 
@@ -1267,6 +1720,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         let finalToken = mainTokens[accepted ... accepted]
         processor?.didSample(token: finalToken)
         pendingTokens.append(mainTokensList[accepted])
+        recordLogProbabilities(
+            of: [mainTokens[0 ... accepted]], sampledFrom: [verifyLogits[0 ... accepted]])
         mainCommittedPendingTokenCount = accepted
         // When every draft is accepted the draft cache still trails the main
         // cache by one accepted token; `draftY` carries that token into the
@@ -1280,9 +1735,22 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             targetVerified: numDraft + 1
         )
 
-        // Rewind caches for rejected tokens
-        mainCacheStorage.trim(numDraft - accepted)
-        draftCacheStorage.trim(Swift.max(numDraft - accepted - 1, 0))
+        // Rewind caches for rejected tokens. Committing a staged round keeps what `y` carried
+        // plus the accepted prefix and the correction token, drops the rejected tail without the
+        // live caches ever holding it, and advances the processed-token timeline to match.
+        if let round {
+            mainCacheStorage.commit(round, retaining: ySize + accepted)
+        } else {
+            mainCacheStorage.trim(numDraft - accepted)
+        }
+        let draftTrimRequest = Swift.max(numDraft - accepted - 1, 0)
+        if draftCacheStorage.trim(draftTrimRequest) < draftTrimRequest,
+            !draftCache.isEmpty
+        {
+            // A draft cache that cannot rewind (its own window wrapped) would desynchronize
+            // future proposals: stop speculating rather than draft from a corrupted history.
+            passthroughReason = "draft KV cache could not rewind rejected drafts"
+        }
 
         // Apply dynamic cache quantization after rewind
         kvCachePlan.apply(to: mainCacheStorage)
@@ -1304,6 +1772,44 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
+    /// One non-speculative decode step for the sticky fallback: feed the last
+    /// sampled token, sample the next, and commit exactly one position — no
+    /// rewind is ever needed, so no rewindability is required.
+    private mutating func plainRound() {
+        let result = mainModel(y[text: .newAxis], cache: mainCache, state: state)
+        mainCacheStorage.commitProcessedTokens(y.cacheSequenceLength)
+        state = result.state
+        var logits = result.logits[0..., -1, 0...]
+        logits = processor?.process(logits: logits) ?? logits
+        let token = sampler.sample(logits: logits)
+        processor?.didSample(token: token)
+        eval(token)
+        pendingTokens.append(token.item(Int.self))
+        recordLogProbabilities(of: [token], sampledFrom: [logits])
+        mainCommittedPendingTokenCount = 0
+        draftCommittedPendingTokenCount = 0
+        y = .init(tokens: token)
+        kvCachePlan.apply(to: mainCacheStorage)
+    }
+
+    /// Records the verifier's log probabilities for tokens just queued in `pendingTokens`.
+    private mutating func recordLogProbabilities(
+        of tokens: [MLXArray], sampledFrom logits: [MLXArray]
+    ) {
+        pendingLogProbabilities += DeferredTokenLogProbabilities.recording(
+            tokens, sampledFrom: logits, topK: logProbabilityTopK)
+    }
+
+    /// Returns the next queued token and makes its log probabilities current.
+    private mutating func dequeuePendingToken() -> Int {
+        lastLogProbabilities =
+            logProbabilityTopK == nil ? nil : pendingLogProbabilities[pendingIndex]
+        let token = pendingTokens[pendingIndex]
+        pendingIndex += 1
+        telemetry.recordGeneratedToken()
+        return token
+    }
+
     mutating public func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
@@ -1311,16 +1817,14 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
         // Drain the pending buffer first
         if pendingIndex < pendingTokens.count {
-            let token = pendingTokens[pendingIndex]
-            pendingIndex += 1
-            telemetry.recordGeneratedToken()
-            return token
+            return dequeuePendingToken()
         }
 
         // Run a new speculation round. Pooled: a round runs draft + verify
         // forwards whose autoreleased MLX temporaries otherwise accumulate
         // across the whole generation.
         pendingTokens.removeAll(keepingCapacity: true)
+        pendingLogProbabilities.removeAll(keepingCapacity: true)
         pendingIndex = 0
         mainCommittedPendingTokenCount = 0
         draftCommittedPendingTokenCount = 0
@@ -1330,23 +1834,37 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             return nil
         }
 
-        let token = pendingTokens[pendingIndex]
-        pendingIndex += 1
-        telemetry.recordGeneratedToken()
-        return token
+        return dequeuePendingToken()
     }
 
 }
 
 extension SpeculativeTokenIterator: GenerationFinalizingTokenIterator {
     mutating func finalizeGeneration() {
+        defer { processor?.finalizeGeneration() }
+        // A round that accepted every draft left the last one for the next round to feed
+        // (`draftY` carries it). Feed it now if it was returned, so both caches end together.
+        if draftCommittedPendingTokenCount < mainCommittedPendingTokenCount,
+            pendingIndex >= mainCommittedPendingTokenCount,
+            passthroughReason == nil, !Task.isCancelled
+        {
+            let lastDraft = LMInput.Text(tokens: draftY.tokens[0 ..< 1])
+            _ = draftModel(lastDraft[text: .newAxis], cache: draftCache, state: nil)
+            eval(draftCache)
+            draftCacheStorage.commitProcessedTokens(1)
+            draftCommittedPendingTokenCount += 1
+        }
+
         // Trim through the storages so the model-wide processed-token timeline
         // rewinds with the caches; `ChatSession` reconciles its ledger against
         // that timeline, not against per-entry offsets.
         let mainConsumed = Swift.min(pendingIndex, mainCommittedPendingTokenCount)
         let mainLookahead = mainCommittedPendingTokenCount - mainConsumed
         if mainLookahead > 0 {
-            mainCacheStorage.trim(mainLookahead)
+            // The staged-round commit recorded how to take back positions a
+            // trim cannot (a wrapped sliding-window ring); `rewindLastRound`
+            // uses that record and falls back to a plain trim otherwise.
+            mainCacheStorage.rewindLastRound(mainLookahead)
         }
 
         let draftConsumed = Swift.min(pendingIndex, draftCommittedPendingTokenCount)
@@ -1454,6 +1972,8 @@ private struct SynchronousGenerationLoopResult {
     let generateTime: TimeInterval
     let promptPrefillTime: TimeInterval
     let stopReason: GenerateStopReason
+    let evictedTokenCount: Int
+    let reasoningTokenCount: Int?
 }
 
 private func buildStopTokenIds(
@@ -1489,6 +2009,7 @@ private func runSynchronousGenerationLoop(
 
     var generatedTokenIds = [Int]()
     var iterator = iterator
+    let tracksReasoningTokenCount = iterator.reasoningTokenCount != nil
     var stopReason: GenerateStopReason?
 
     while let token = autoreleasepool(invoking: { iterator.next() }) {
@@ -1506,6 +2027,9 @@ private func runSynchronousGenerationLoop(
         }
 
         generatedTokenIds.append(token)
+        if tracksReasoningTokenCount {
+            iterator.recordEmittedToken(token)
+        }
 
         if didGenerate(token, generatedTokenIds) == .stop {
             stopReason = .cancelled
@@ -1525,18 +2049,25 @@ private func runSynchronousGenerationLoop(
     let now = Date.timeIntervalSinceReferenceDate
     let generateTime = now - start
 
+    iterator.finalizeGeneration()
+    let reasoningTokenCount = iterator.reasoningTokenCount.map {
+        Swift.min(Swift.max($0, 0), generatedTokenIds.count)
+    }
+
     // TokenIterator uses `asyncEval()` to keep the pipeline full. If the caller
     // exits the program right away, those tasks will still be executing and will
     // hit assertions as the mlx scheduler is torn down. Synchronize with the stream
     // to make sure it is complete.
-    Stream().synchronize()
+    Stream.defaultStream.synchronize()
 
     return SynchronousGenerationLoopResult(
         generatedTokenIds: generatedTokenIds,
         promptTime: promptTime,
         generateTime: generateTime,
         promptPrefillTime: iterator.promptPrefillTime,
-        stopReason: stopReason ?? .cancelled
+        stopReason: stopReason ?? .cancelled,
+        evictedTokenCount: iterator.evictedTokenCount,
+        reasoningTokenCount: reasoningTokenCount
     )
 }
 
@@ -1698,6 +2229,11 @@ public func generate(
     return GenerateCompletionInfo(
         promptTokenCount: input.text.tokens.size,
         generationTokenCount: result.generatedTokenIds.count,
+        evictedTokenCount: result.evictedTokenCount,
+        reasoningTokenCount: result.reasoningTokenCount,
+        answerTokenCount: result.reasoningTokenCount.map {
+            result.generatedTokenIds.count - $0
+        },
         promptTime: result.promptTime + result.promptPrefillTime,
         generationTime: result.generateTime,
         stopReason: result.stopReason
@@ -1708,13 +2244,13 @@ public func generate(
 ///
 /// This function initializes a `TokenIterator` with the given input, model, and generation parameters,
 /// and then streams the token generation process via an `AsyncStream`. The resulting stream yields
-/// instances of the `Generation` enum, which can represent text chunks, tool calls, or summary
-/// completion information.
+/// instances of the `Generation` enum, which can represent text chunks, tool calls,
+/// or summary completion information.
 ///
 /// * Important: if the stream is terminated early (e.g. break from the loop) computation will continue
 /// using the model, parameters, KVCache, etc. for some time (typically a few ms).  This is typically OK for
 /// one-shot calls, but for "chat session" type calls consider using
-/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:wiredMemoryTicket:tools:)``
+/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:wiredMemoryTicket:tools:toolCallPolicy:reasoningPrimedInside:)``
 /// so that the end of the generation task can be observed.
 ///
 /// - Parameters:
@@ -1753,12 +2289,16 @@ public func generate(
 ///     switch generation {
 ///     case .chunk(let text):
 ///         print("Generated text: \(text)")
+///     case .reasoning(let text):
+///         print("Thinking: \(text)")
 ///     case .info(let info):
 ///         print("Finished: \(info.tokensPerSecond) tokens/s.")
 ///     case .toolCall(let call):
 ///         print("Tool call: \(call.function.name)")
 ///     case .rejectedToolCall(let rejection):
 ///         print("Rejected tool call: \(rejection.reason)")
+///     case .steering:
+///         break
 ///     }
 /// }
 /// ```
@@ -1769,6 +2309,25 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
+    // Read the prompt before the iterator queues its prefill, which this would wait for.
+    let reasoningPrimedInside = promptPrimesReasoning(
+        input: input, modelConfiguration: context.configuration, tokenizer: context.tokenizer)
+    if let diffusionModel = context.model as? any BlockDiffusionLanguageModel {
+        let iterator = try BlockDiffusionTokenIterator(
+            input: input, model: diffusionModel, cache: cache, parameters: parameters,
+            components: components)
+        let (stream, _) = generateTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            wiredMemoryTicket: wiredMemoryTicket,
+            tools: tools,
+            toolCallPolicy: parameters.toolCallPolicy,
+            reasoningPrimedInside: reasoningPrimedInside)
+        return stream
+    }
+
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, state: state,
         parameters: parameters, components: components)
@@ -1778,7 +2337,9 @@ public func generate(
         tokenizer: context.tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
-        tools: tools)
+        tools: tools,
+        toolCallPolicy: parameters.toolCallPolicy,
+        reasoningPrimedInside: reasoningPrimedInside)
     return stream
 }
 
@@ -1808,12 +2369,16 @@ public func generate(
 ///     switch generation {
 ///     case .chunk(let text):
 ///         print("Generated text: \(text)")
+///     case .reasoning(let text):
+///         print("Thinking: \(text)")
 ///     case .info(let info):
 ///         print("Finished: \(info.tokensPerSecond) tokens/s.")
 ///     case .toolCall(let call):
 ///         print("Tool call: \(call.function.name)")
 ///     case .rejectedToolCall(let rejection):
 ///         print("Rejected tool call: \(rejection.reason)")
+///     case .steering:
+///         break
 ///     }
 /// }
 /// ```
@@ -1832,6 +2397,7 @@ public func generate(
 ///   - numDraftTokens: Number of tokens the draft model proposes per round (default: 2).
 ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
+///   - tools: Optional tool schemas used to parse arguments and authorize function names.
 /// - Returns: An `AsyncStream` that emits text, accepted or rejected tool calls, and completion
 ///   information as `Generation` values.
 /// - Throws: An error if the iterator initialization fails.
@@ -1845,8 +2411,19 @@ public func generate(
     draftCache: [KVCache]? = nil,
     numDraftTokens: Int = 2,
     components: GenerationComponents = .init(),
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
+    // Read the prompt before the iterator queues its prefill, which this would wait for.
+    let reasoningPrimedInside = promptPrimesReasoning(
+        input: input, modelConfiguration: context.configuration, tokenizer: context.tokenizer)
+    if context.model.capabilities.contains(.blockDiffusion)
+        || draftModel.capabilities.contains(.blockDiffusion)
+    {
+        throw GenerateError.unsupportedSpeculativeDecoding(
+            String(describing: type(of: context.model)))
+    }
+
     let iterator = try SpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -1867,7 +2444,12 @@ public func generate(
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
             stopStrings: context.configuration.effectiveStopStrings,
-            format: context.configuration.toolCallFormat ?? .json
+            format: context.configuration.toolCallFormat ?? .json,
+            tools: tools,
+            toolCallPolicy: parameters.toolCallPolicy,
+            reasoning: context.configuration.reasoningConfig.map {
+                (config: $0, primedInside: reasoningPrimedInside)
+            }
         )
     )
     return stream
@@ -1887,7 +2469,10 @@ public func generate(
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
-        wiredMemoryTicket: wiredMemoryTicket)
+        wiredMemoryTicket: wiredMemoryTicket,
+        reasoningPrimedInside: promptPrimesReasoning(
+            input: input, modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer))
     return stream
 }
 
@@ -1907,6 +2492,13 @@ public func generate(
 ///   - iterator: a token iterator conforming to ``TokenIteratorProtocol``
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
 ///   - tools: Optional tool schemas used to parse tool-call arguments into their declared types.
+///   - toolCallPolicy: Recovery and validation rules for generated tool calls.
+///   - reasoningPrimedInside: whether the rendered prompt ends inside an open reasoning
+///     block, which some families prefill (e.g. DeepSeek-R1's trailing `<think>`). Callers
+///     holding the prompt should pass
+///     ``ReasoningEventEmitter/promptEndsInsideReasoning(promptTokens:config:tokenizer:)``;
+///     leaving it `false` would misroute a primed model's whole thought block into `.chunk`.
+///     Check the whole rendered prompt, not only the part a prompt cache left to prefill.
 /// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
 public func generateTask<TOKEN: TokenIteratorProtocol>(
     promptTokenCount: Int,
@@ -1914,7 +2506,9 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
     tokenizer: Tokenizer,
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
-    tools: [[String: any Sendable]]? = nil
+    tools: [[String: any Sendable]]? = nil,
+    toolCallPolicy: ToolCallPolicy = .init(),
+    reasoningPrimedInside: Bool = false
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1926,21 +2520,35 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
             tokenizer: tokenizer,
             stopStrings: modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
-            tools: tools
+            tools: tools,
+            toolCallPolicy: toolCallPolicy,
+            reasoning: modelConfiguration.reasoningConfig.map {
+                (config: $0, primedInside: reasoningPrimedInside)
+            }
         )
     )
 }
 
 /// Internal variant used by `ChatSession` to keep its token-prefix record in
-/// lockstep with the KV cache.
+/// lockstep with the KV cache and receive the iterator's finalized
+/// continuation state.
+struct RecordedGenerationResult {
+    let generatedTokens: [Int]
+    let state: LMOutput.State?
+    let mtpDrafterContinuation: MTPDrafterContinuation?
+}
+
 func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
-    tools: [[String: any Sendable]]? = nil
-) -> (AsyncStream<Generation>, Task<[Int], Never>) {
+    tools: [[String: any Sendable]]? = nil,
+    toolCallPolicy: ToolCallPolicy = .init(),
+    reasoningPrimedInside: Bool = false,
+    steering: SteeringControl? = nil
+) -> (AsyncStream<Generation>, Task<SendableBox<RecordedGenerationResult>, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
@@ -1948,13 +2556,63 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
         tokenCollector: RecordingGeneratedTokens(),
+        steering: steering,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
             stopStrings: modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
-            tools: tools
+            tools: tools,
+            toolCallPolicy: toolCallPolicy,
+            reasoning: modelConfiguration.reasoningConfig.map {
+                (config: $0, primedInside: reasoningPrimedInside)
+            }
         )
     )
+}
+
+/// Whether the rendered prompt ends inside an open reasoning block, for seeding the
+/// token loop's reasoning scanner.
+///
+/// The prompt is decoded only when the model resolves a
+/// ``ModelConfiguration/reasoningConfig``, and then only its tail: a prefilled
+/// delimiter is the last thing a generation prompt writes, so copying a long prompt
+/// out of its `MLXArray` to read the final few tokens would cost more than it saves.
+func promptPrimesReasoning(
+    input: LMInput, modelConfiguration: ModelConfiguration, tokenizer: Tokenizer
+) -> Bool {
+    guard let config = modelConfiguration.reasoningConfig else { return false }
+    // Flatten first. VLM processors emit `[1, N]`, and a range subscript slices axis 0,
+    // so slicing the unflattened array would take the batch axis, not the tokens.
+    let tokens = input.text.tokens.flattened()
+    guard tokens.size > 0 else { return false }
+    var count = min(ReasoningEventEmitter.promptTailTokenCount, tokens.size)
+    while true {
+        let primed = ReasoningEventEmitter.promptEndsInsideReasoning(
+            tailTokens: tokens[(tokens.size - count)...].asArray(Int.self),
+            isWholePrompt: count == tokens.size,
+            config: config, tokenizer: tokenizer)
+        if let primed { return primed }
+        count = min(tokens.size, count * 2)
+    }
+}
+
+/// Records the same token ledger with a composed output handler.
+func generateTaskRecordingTokens<Handler: TokenLoopHandler>(
+    promptTokenCount: Int,
+    modelConfiguration: ModelConfiguration,
+    tokenizer: Tokenizer,
+    iterator: consuming any TokenIteratorProtocol,
+    steering: SteeringControl? = nil,
+    handler: consuming Handler
+) -> (AsyncStream<Handler.Output>, Task<SendableBox<RecordedGenerationResult>, Never>) {
+    generateLoopTask(
+        promptTokenCount: promptTokenCount,
+        modelConfiguration: modelConfiguration,
+        tokenizer: tokenizer,
+        iterator: iterator,
+        tokenCollector: RecordingGeneratedTokens(),
+        steering: steering,
+        handler: handler)
 }
 
 /// Generates raw token IDs asynchronously using the provided language model input, parameters, and context.
@@ -1987,6 +2645,21 @@ public func generateTokens(
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
+    if let diffusionModel = context.model as? any BlockDiffusionLanguageModel {
+        let iterator = try BlockDiffusionTokenIterator(
+            input: input, model: diffusionModel, cache: cache, parameters: parameters,
+            components: components)
+        let (stream, _) = generateTokenTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            includeStopToken: includeStopToken,
+            wiredMemoryTicket: wiredMemoryTicket
+        )
+        return stream
+    }
+
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, state: state,
         parameters: parameters, components: components)
@@ -2036,6 +2709,13 @@ public func generateTokens(
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
+    if context.model.capabilities.contains(.blockDiffusion)
+        || draftModel.capabilities.contains(.blockDiffusion)
+    {
+        throw GenerateError.unsupportedSpeculativeDecoding(
+            String(describing: type(of: context.model)))
+    }
+
     let iterator = try SpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2060,7 +2740,7 @@ public func generateTokens(
 
 /// Generates tokens asynchronously using MTP speculative decoding.
 ///
-/// Parallel to ``generate(input:cache:state:parameters:context:draftModel:draftCache:numDraftTokens:components:wiredMemoryTicket:)``
+/// Parallel to ``generate(input:cache:state:parameters:context:draftModel:draftCache:numDraftTokens:components:wiredMemoryTicket:tools:)``
 /// but for MTP drafters: the drafter shares K/V with the target model and
 /// produces a block of `blockSize - 1` candidate tokens per round in a
 /// single `draftBlock(...)` call. The drafter shares the target's
@@ -2087,6 +2767,7 @@ public func generateTokens(
 ///     `draft_block_size`. Default 4 matches mlx-vlm's example configs.
 ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
 ///   - wiredMemoryTicket: optional wired memory ticket.
+///   - tools: Optional tool schemas used to parse arguments and authorize function names.
 /// - Returns: an `AsyncStream<Generation>` yielding chunks and tool calls.
 /// - Throws: an error if the iterator initialization fails.
 public func generate(
@@ -2097,8 +2778,12 @@ public func generate(
     mtpDrafter: any MTPDrafterModel,
     blockSize: Int = 4,
     components: GenerationComponents = .init(),
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
+    // Read the prompt before the iterator queues its prefill, which this would wait for.
+    let reasoningPrimedInside = promptPrimesReasoning(
+        input: input, modelConfiguration: context.configuration, tokenizer: context.tokenizer)
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2117,7 +2802,12 @@ public func generate(
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
             stopStrings: context.configuration.effectiveStopStrings,
-            format: context.configuration.toolCallFormat ?? .json
+            format: context.configuration.toolCallFormat ?? .json,
+            tools: tools,
+            toolCallPolicy: parameters.toolCallPolicy,
+            reasoning: context.configuration.reasoningConfig.map {
+                (config: $0, primedInside: reasoningPrimedInside)
+            }
         )
     )
     return stream
@@ -2198,6 +2888,20 @@ public func generateTokensTask(
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
+    if let diffusionModel = context.model as? any BlockDiffusionLanguageModel {
+        let iterator = try BlockDiffusionTokenIterator(
+            input: input, model: diffusionModel, cache: cache, parameters: parameters,
+            components: components)
+        return generateTokenTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            includeStopToken: includeStopToken,
+            wiredMemoryTicket: wiredMemoryTicket
+        )
+    }
+
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, state: state,
         parameters: parameters, components: components)
@@ -2275,16 +2979,36 @@ public func generateTokenTask(
     )
 }
 
+/// Low-level raw token generation using any token iterator implementation.
+public func generateTokenTask(
+    promptTokenCount: Int,
+    modelConfiguration: ModelConfiguration,
+    tokenizer: Tokenizer,
+    iterator: consuming any TokenIteratorProtocol,
+    includeStopToken: Bool = false,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
+    generateLoopTask(
+        promptTokenCount: promptTokenCount,
+        modelConfiguration: modelConfiguration,
+        tokenizer: tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        includeStopToken: includeStopToken,
+        handler: RawTokenLoopHandler()
+    )
+}
+
 private protocol GeneratedTokenCollector: Sendable {
     associatedtype Result: Sendable
 
     mutating func record(_ token: Int)
-    consuming func result() -> Result
+    consuming func result(iterator: any TokenIteratorProtocol) -> Result
 }
 
 private struct IgnoringGeneratedTokens: GeneratedTokenCollector {
     mutating func record(_ token: Int) {}
-    consuming func result() {}
+    consuming func result(iterator _: any TokenIteratorProtocol) {}
 }
 
 private struct RecordingGeneratedTokens: GeneratedTokenCollector {
@@ -2294,12 +3018,25 @@ private struct RecordingGeneratedTokens: GeneratedTokenCollector {
         tokens.append(token)
     }
 
-    consuming func result() -> [Int] {
-        tokens
+    consuming func result(
+        iterator: any TokenIteratorProtocol
+    ) -> SendableBox<RecordedGenerationResult> {
+        let mtpContinuation =
+            (iterator as? any MTPDrafterContinuationProviding)?
+            .mtpDrafterContinuation
+        return SendableBox(
+            RecordedGenerationResult(
+                generatedTokens: tokens,
+                state: iterator.state,
+                mtpDrafterContinuation: mtpContinuation))
     }
 }
 
-private func generateLoopTask<Handler: TokenLoopHandler>(
+/// Runs a token iterator with a custom output handler.
+///
+/// The task owns the iterator and handler until generation finishes. Await its
+/// value after cancelling or stopping consumption to wait for MLX cleanup.
+public func generateLoopTask<Handler: TokenLoopHandler>(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
@@ -2329,17 +3066,21 @@ private func generateLoopTask<
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     includeStopToken: Bool = false,
     tokenCollector: consuming Collector,
+    steering: SteeringControl? = nil,
     handler: consuming Handler
 ) -> (AsyncStream<Handler.Output>, Task<Collector.Result, Never>) {
     let (stream, continuation) = AsyncStream<Handler.Output>.makeStream()
 
+    let executionStream = StreamOrDevice.default.stream
     let iterator = SendableBox(iterator)
     let handler = SendableBox(handler)
     let tokenCollector = consume tokenCollector
 
-    // Launch a Task to perform iteration asynchronously.
+    // Keep task cancellation and task-local values while moving blocking MLX work
+    // onto a separate queue for each generation.
     let task = Task {
-        let performIteration = {
+        let worker = GenerationWorker()
+        let performIteration = { @Sendable in
             var iterator = iterator.consume()
             var handler = handler.consume()
             var tokenCollector = tokenCollector
@@ -2348,6 +3089,11 @@ private func generateLoopTask<
             var promptTime: TimeInterval = 0
             var tokenCount = 0
             var stopReason: GenerateStopReason?
+            let emit: (sending Handler.Output) -> Bool = {
+                if case .terminated = continuation.yield($0) { return false }
+                return true
+            }
+            let tracksReasoningTokenCount = iterator.reasoningTokenCount != nil
 
             var stopTokenIds = buildStopTokenIds(
                 modelConfiguration: modelConfiguration,
@@ -2360,9 +3106,13 @@ private func generateLoopTask<
             // `while let token = iterator.next()` form) allowed one extra asyncEval to be
             // submitted post-cancellation, which faults if the app has backgrounded
             // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted). The
-            // post-loop block below assigns `.cancelled`; Stream().synchronize() still
+            // post-loop block below assigns `.cancelled`; the captured execution stream still
             // settles any in-flight evaluation at the end of the task body.
             tokenLoop: while !Task.isCancelled {
+                if let steering, handler.canEndForSteering, steering.requestsEarlyBoundary {
+                    stopReason = steering.isInterrupted ? .interrupted : .steered
+                    break
+                }
                 guard let token = autoreleasepool(invoking: { iterator.next() }) else { break }
                 tokenCollector.record(token)
 
@@ -2380,10 +3130,18 @@ private func generateLoopTask<
                     if deliverToHandler {
                         if includeStopToken {
                             tokenCount += 1
+                            if tracksReasoningTokenCount {
+                                iterator.recordEmittedToken(token)
+                            }
                         } else {
                             iterator.discardGeneratedToken()
                         }
-                        switch handler.onStopToken(token, emit: continuation.yield) {
+                        switch handler.onStopToken(
+                            token,
+                            logProbabilities: includeStopToken
+                                ? iterator.lastLogProbabilities : nil,
+                            emit: emit)
+                        {
                         case .more:
                             break
                         case .stop:
@@ -2401,7 +3159,14 @@ private func generateLoopTask<
                 }
 
                 tokenCount += 1
-                switch handler.onToken(token, emit: continuation.yield) {
+                if tracksReasoningTokenCount {
+                    iterator.recordEmittedToken(token)
+                }
+                switch handler.onToken(
+                    token,
+                    logProbabilities: iterator.lastLogProbabilities,
+                    emit: emit)
+                {
                 case .more:
                     break
                 case .stop:
@@ -2423,10 +3188,12 @@ private func generateLoopTask<
                 }
             }
 
-            // Speculative iterators verify several candidates at once. A stop
-            // token, consumer termination, or token limit can leave verified
-            // but unreturned candidates in their shared caches. Remove that
-            // lookahead before ChatSession reconciles its token ledger.
+            // Speculative iterators verify several candidates at once and
+            // block-diffusion iterators denoise a whole canvas ahead of the
+            // emitted tokens. A stop token, consumer termination, or token
+            // limit can leave deferred work (verified candidates, uncommitted
+            // canvas tokens) that must be reconciled with what the loop
+            // actually emitted before ChatSession reconciles its token ledger.
             if var finalizing = iterator as? any GenerationFinalizingTokenIterator {
                 finalizing.finalizeGeneration()
                 // Write back: the cast copies the iterator, and the trim also
@@ -2435,15 +3202,28 @@ private func generateLoopTask<
                 iterator = finalizing
             }
 
-            handler.onGenerationEnd(emit: continuation.yield)
+            switch handler.onGenerationEnd(emit: emit) {
+            case .more:
+                break
+            case .stop:
+                if stopReason != .cancelled { stopReason = .stop }
+            case .cancelled:
+                stopReason = .cancelled
+            }
 
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
 
             let mtpStats = iterator as? MTPStatsCollecting
+            let reasoningTokenCount = iterator.reasoningTokenCount.map {
+                Swift.min(Swift.max($0, 0), tokenCount)
+            }
             let info = GenerateCompletionInfo(
                 promptTokenCount: promptTokenCount,
                 generationTokenCount: tokenCount,
+                evictedTokenCount: iterator.evictedTokenCount,
+                reasoningTokenCount: reasoningTokenCount,
+                answerTokenCount: reasoningTokenCount.map { tokenCount - $0 },
                 promptTime: promptTime + iterator.promptPrefillTime,
                 generationTime: generateTime,
                 stopReason: stopReason ?? .cancelled,
@@ -2455,20 +3235,22 @@ private func generateLoopTask<
             _ = continuation.yield(handler.infoEvent(info))
 
             // Synchronize with the stream to ensure tasks are completed
-            Stream().synchronize()
+            executionStream.synchronize()
+
+            let result = tokenCollector.result(iterator: iterator)
 
             // Finalize the stream
             continuation.finish()
 
-            return tokenCollector.result()
+            return result
         }
 
         if let ticket = wiredMemoryTicket {
             return await WiredMemoryTicket.withWiredLimit(ticket) {
-                performIteration()
+                await worker.run(performIteration)
             }
         } else {
-            return performIteration()
+            return await worker.run(performIteration)
         }
     }
 
@@ -2499,6 +3281,14 @@ public enum GenerateStopReason: Sendable {
     /// Generation stopped because the configured max token limit was reached.
     case length
 
+    /// This model step ended at a supported boundary to apply pending steering.
+    /// The owning chat turn continues with the additional user input.
+    case steered
+
+    /// This model step ended at a supported boundary because its chat response was
+    /// interrupted. The response keeps its output and ends.
+    case interrupted
+
     /// Generation stopped due to explicit task cancellation or early stream termination.
     case cancelled
 }
@@ -2525,6 +3315,15 @@ public struct GenerateCompletionInfo: Sendable {
     /// The number of tokens generated by the language model.
     public let generationTokenCount: Int
 
+    /// Context tokens no longer retained by at least one rotating attention cache.
+    public let evictedTokenCount: Int
+
+    /// Tokens emitted inside the reasoning span when a thinking budget was configured.
+    public let reasoningTokenCount: Int?
+
+    /// Generated tokens outside the reasoning span when a thinking budget was configured.
+    public let answerTokenCount: Int?
+
     /// The time interval (in seconds) taken to process the input prompt.
     public let promptTime: TimeInterval
 
@@ -2545,17 +3344,27 @@ public struct GenerateCompletionInfo: Sendable {
     /// are non-nil and proposed > 0.
     public let acceptedDraftTokens: Int?
 
-    /// Non-nil when the MTP iterator transitioned into sticky-passthrough
-    /// mode for the remainder of the stream; carries the reason string
-    /// captured at the moment of engagement. Nil if the iterator stayed
-    /// speculative for the full stream or for non-MTP streams.
+    /// Non-nil when the MTP iterator transitioned into sticky passthrough or
+    /// could not export a resumable stateful boundary. Carries the first
+    /// failure reason. Nil when speculation completed with a resumable
+    /// boundary, or for non-MTP streams.
     public let passthroughReason: String?
 
     /// Speculative decoding telemetry, when generation used speculative decoding.
     public let speculativeDecodingTelemetry: SpeculativeDecodingTelemetry?
 
+    /// Why ``ChatSession`` selected ordinary generation despite configured speculation.
+    ///
+    /// Nil means no session fallback was recorded; it does not prove speculative rounds occurred.
+    /// Lower-level generation APIs leave this nil; MTP iterator diagnostics use ``passthroughReason``.
+    public internal(set) var speculativeDecodingFallbackReason: SpeculativeDecodingFallbackReason?
+
     /// Number of tool-call-shaped outputs rejected during this generation.
     public let rejectedToolCallCount: Int
+
+    /// Number of accepted calls produced by bounded cross-dialect recovery.
+    /// Native-format calls are intentionally excluded.
+    public let recoveredToolCallCount: Int
 
     /// The rendered prompt length: the reused cache prefix plus the prefilled tokens.
     public var totalPromptTokenCount: Int {
@@ -2582,6 +3391,9 @@ public struct GenerateCompletionInfo: Sendable {
         promptTokenCount: Int,
         cachedPromptTokenCount: Int = 0,
         generationTokenCount: Int,
+        evictedTokenCount: Int = 0,
+        reasoningTokenCount: Int? = nil,
+        answerTokenCount: Int? = nil,
         promptTime: TimeInterval,
         generationTime: TimeInterval,
         stopReason: GenerateStopReason = .stop,
@@ -2589,11 +3401,16 @@ public struct GenerateCompletionInfo: Sendable {
         acceptedDraftTokens: Int? = nil,
         passthroughReason: String? = nil,
         speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? = nil,
-        rejectedToolCallCount: Int = 0
+        rejectedToolCallCount: Int = 0,
+        recoveredToolCallCount: Int = 0,
+        speculativeDecodingFallbackReason: SpeculativeDecodingFallbackReason? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.cachedPromptTokenCount = cachedPromptTokenCount
         self.generationTokenCount = generationTokenCount
+        self.evictedTokenCount = evictedTokenCount
+        self.reasoningTokenCount = reasoningTokenCount
+        self.answerTokenCount = answerTokenCount
         self.promptTime = promptTime
         self.generateTime = generationTime
         self.stopReason = stopReason
@@ -2602,6 +3419,8 @@ public struct GenerateCompletionInfo: Sendable {
         self.passthroughReason = passthroughReason
         self.speculativeDecodingTelemetry = speculativeDecodingTelemetry
         self.rejectedToolCallCount = rejectedToolCallCount
+        self.recoveredToolCallCount = recoveredToolCallCount
+        self.speculativeDecodingFallbackReason = speculativeDecodingFallbackReason
     }
 
     public func summary() -> String {
@@ -2614,14 +3433,24 @@ public struct GenerateCompletionInfo: Sendable {
                 "Cache:      \(cachedPromptTokenCount)/\(totalPromptTokenCount) prompt tokens reused, \(cacheEfficiency.formatted(.percent.precision(.fractionLength(0)))) efficiency"
             )
         }
+        if evictedTokenCount > 0 {
+            lines.append("Cache:      \(evictedTokenCount) context tokens dropped")
+        }
+        if let reasoningTokenCount, let answerTokenCount {
+            lines.append(
+                "Reasoning:  \(reasoningTokenCount) tokens, answer: \(answerTokenCount) tokens")
+        }
         return lines.joined(separator: "\n")
     }
 
-    fileprivate func withRejectedToolCallCount(_ count: Int) -> Self {
+    func withToolCallCounts(rejected: Int, recovered: Int) -> Self {
         Self(
             promptTokenCount: promptTokenCount,
             cachedPromptTokenCount: cachedPromptTokenCount,
             generationTokenCount: generationTokenCount,
+            evictedTokenCount: evictedTokenCount,
+            reasoningTokenCount: reasoningTokenCount,
+            answerTokenCount: answerTokenCount,
             promptTime: promptTime,
             generationTime: generateTime,
             stopReason: stopReason,
@@ -2629,7 +3458,9 @@ public struct GenerateCompletionInfo: Sendable {
             acceptedDraftTokens: acceptedDraftTokens,
             passthroughReason: passthroughReason,
             speculativeDecodingTelemetry: speculativeDecodingTelemetry,
-            rejectedToolCallCount: count)
+            rejectedToolCallCount: rejected,
+            recoveredToolCallCount: recovered,
+            speculativeDecodingFallbackReason: speculativeDecodingFallbackReason)
     }
 }
 
@@ -2637,12 +3468,28 @@ public struct GenerateCompletionInfo: Sendable {
 ///
 /// This enum distinguishes between the following:
 /// - `.chunk`: A decoded string from one or more tokens generated by the language model.
+/// - `.reasoning`: Thinking text the model framed as private to itself.
 /// - `.toolCall`: A tool call parsed from the generated output.
 /// - `.rejectedToolCall`: Tool-call-shaped output that was not executable.
 /// - `.info`: Metadata and performance statistics about the generation process.
+/// - `.steering`: The outcome of accepted steering instructions.
 public enum Generation: Sendable {
     /// A generated text chunk as a String.
     case chunk(String)
+
+    /// Thinking text, delivered separately from the answer and with the
+    /// protocol's delimiters already removed.
+    ///
+    /// Only produced for models whose response protocol frames reasoning: a
+    /// resolved ``ModelConfiguration/reasoningConfig`` (`<think>` families,
+    /// Gemma 4's labeled channels) or a framed token protocol that carries its
+    /// own reasoning channel (GPT-OSS Harmony, Onyx).
+    ///
+    /// Reasoning is *not* part of ``chunk``, so a caller recording the assistant
+    /// turn should record ``chunk`` alone as its content. Most of these families'
+    /// chat templates drop reasoning from replayed history. ``ChatSession`` keeps a
+    /// finished thought beside the message for the templates that replay it.
+    case reasoning(String)
 
     /// Completion information summarizing token counts and performance metrics.
     case info(GenerateCompletionInfo)
@@ -2653,13 +3500,30 @@ public enum Generation: Sendable {
     /// A tool-call-shaped model output rejected by parsing or authorization.
     case rejectedToolCall(RejectedToolCall)
 
+    /// The outcome of steering instructions submitted to a chat session.
+    case steering(SteeringEvent)
+
     /// Generated text or nil
     public var chunk: String? {
         switch self {
         case .chunk(let string): string
+        case .reasoning: nil
         case .info: nil
         case .toolCall: nil
         case .rejectedToolCall: nil
+        case .steering: nil
+        }
+    }
+
+    /// Reasoning text or nil
+    public var reasoning: String? {
+        switch self {
+        case .chunk: nil
+        case .reasoning(let string): string
+        case .info: nil
+        case .toolCall: nil
+        case .rejectedToolCall: nil
+        case .steering: nil
         }
     }
 
@@ -2667,9 +3531,11 @@ public enum Generation: Sendable {
     public var info: GenerateCompletionInfo? {
         switch self {
         case .chunk: nil
+        case .reasoning: nil
         case .info(let info): info
         case .toolCall: nil
         case .rejectedToolCall: nil
+        case .steering: nil
         }
     }
 
@@ -2677,9 +3543,11 @@ public enum Generation: Sendable {
     public var toolCall: ToolCall? {
         switch self {
         case .chunk: nil
+        case .reasoning: nil
         case .info: nil
         case .toolCall(let toolCall): toolCall
         case .rejectedToolCall: nil
+        case .steering: nil
         }
     }
 
@@ -2687,9 +3555,23 @@ public enum Generation: Sendable {
     public var rejectedToolCall: RejectedToolCall? {
         switch self {
         case .chunk: nil
+        case .reasoning: nil
         case .info: nil
         case .toolCall: nil
         case .rejectedToolCall(let rejection): rejection
+        case .steering: nil
+        }
+    }
+
+    /// Steering event or nil.
+    public var steering: SteeringEvent? {
+        switch self {
+        case .chunk: nil
+        case .reasoning: nil
+        case .info: nil
+        case .toolCall: nil
+        case .rejectedToolCall: nil
+        case .steering(let event): event
         }
     }
 
@@ -2699,14 +3581,14 @@ public enum Generation: Sendable {
         (batch ?? []) + [element]
     }
 
-    /// Attributes `count` prompt tokens to a reused KV-cache prefix on a `.info`
-    /// payload; every other case passes through unchanged.
-    ///
-    /// The generation loop is handed an already narrowed prompt, so only the
-    /// cache owner can supply this. See ``GenerateCompletionInfo/cachedPromptTokenCount``.
-    func attributingCachedPromptTokens(_ count: Int) -> Generation {
-        guard count > 0, case .info(var info) = self else { return self }
-        info.cachedPromptTokenCount = count
+    /// Adds session-owned cache and fallback metadata to `.info`; other events pass through.
+    func attributingSessionMetadata(
+        cachedPromptTokenCount: Int,
+        speculativeDecodingFallbackReason: SpeculativeDecodingFallbackReason?
+    ) -> Generation {
+        guard case .info(var info) = self else { return self }
+        info.cachedPromptTokenCount = cachedPromptTokenCount
+        info.speculativeDecodingFallbackReason = speculativeDecodingFallbackReason
         return .info(info)
     }
 }
@@ -2743,201 +3625,5 @@ public enum TokenGeneration: Sendable {
         -> [TokenGeneration]
     {
         (batch ?? []) + [element]
-    }
-}
-
-// MARK: - TokenLoopHandlers
-
-private enum TokenLoopDisposition {
-    case more
-    case stop
-    case cancelled
-
-    var shouldContinue: Bool {
-        if case .more = self { return true }
-        return false
-    }
-}
-
-private protocol TokenLoopHandler {
-    associatedtype Output
-
-    /// Semantic boundaries contributed by the response protocol handled by
-    /// this consumer. Raw-token consumers intentionally contribute none.
-    var additionalStopTokenIDs: Set<Int> { get }
-
-    /// Whether semantic parsing needs to observe EOS tokens even though they
-    /// are not included in the public output or generation token count.
-    var receivesStopTokens: Bool { get }
-
-    /// Return `.stop` for semantic generation stops, or `.cancelled` for consumer termination.
-    mutating func onToken(
-        _ token: Int,
-        emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    ) -> TokenLoopDisposition
-
-    /// Called when `includeStopToken` is true or ``receivesStopTokens`` is true
-    /// and a stop token was hit.
-    mutating func onStopToken(
-        _ token: Int,
-        emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    ) -> TokenLoopDisposition
-
-    /// Called after the token loop finishes, before the info event.
-    mutating func onGenerationEnd(
-        emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    )
-
-    func infoEvent(_ info: GenerateCompletionInfo) -> Output
-}
-
-extension TokenLoopHandler {
-    var additionalStopTokenIDs: Set<Int> { [] }
-    var receivesStopTokens: Bool { false }
-}
-
-private struct TextToolTokenLoopHandler: TokenLoopHandler {
-    typealias Output = Generation
-
-    private static let logger = Logger(
-        subsystem: "mlx-swift-lm", category: "TokenStreamProtocol")
-    private var decoder: any TokenStreamDecoder
-
-    init(
-        tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
-        tools: [[String: any Sendable]]? = nil
-    ) {
-        self.decoder = format.makeTokenStreamDecoder(
-            tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
-    }
-
-    var additionalStopTokenIDs: Set<Int> { decoder.additionalStopTokenIDs }
-    var receivesStopTokens: Bool { decoder.receivesStopTokens }
-
-    mutating func onToken(
-        _ token: Int,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        process(token, emit: emit)
-    }
-
-    mutating func onStopToken(
-        _ token: Int,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        guard decoder.receivesStopTokens else { return .more }
-        return process(token, emit: emit)
-    }
-
-    mutating func onGenerationEnd(
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) {
-        var decoder = self.decoder
-        var disposition = TokenLoopDisposition.more
-        _ = decoder.finish { event in
-            disposition = process(event, emit: emit)
-            return disposition.shouldContinue
-        }
-        self.decoder = decoder
-    }
-
-    func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
-        .info(info.withRejectedToolCallCount(decoder.rejectedToolCallCount))
-    }
-
-    private mutating func process(
-        _ token: Int,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        var decoder = self.decoder
-        var disposition = TokenLoopDisposition.more
-        let completed = decoder.push(token) { event in
-            disposition = process(event, emit: emit)
-            return disposition.shouldContinue
-        }
-        self.decoder = decoder
-
-        if disposition.shouldContinue {
-            return completed ? .more : .cancelled
-        }
-        return disposition
-    }
-
-    private mutating func process(
-        _ event: TokenStreamEvent,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        switch event {
-        case .reasoning:
-            // The public Generation stream intentionally exposes only response
-            // text and tool calls. Protocol-aware clients consume reasoning via
-            // the package-level TokenStreamDecoder contract.
-            return .more
-
-        case .response(let response):
-            if case .terminated = emit(.chunk(response)) {
-                return .cancelled
-            }
-            return .more
-
-        case .toolCall(let toolCall):
-            if case .terminated = emit(.toolCall(toolCall)) {
-                return .cancelled
-            }
-            return .more
-
-        case .protocolError(let message):
-            Self.logger.error("\(message)")
-            return .more
-
-        case .rejectedToolCall(let rejection):
-            if case .terminated = emit(.rejectedToolCall(rejection)) {
-                return .cancelled
-            }
-            return .more
-
-        case .stop:
-            return .stop
-        }
-    }
-}
-
-private struct RawTokenLoopHandler: TokenLoopHandler {
-    typealias Output = TokenGeneration
-
-    let additionalStopTokenIDs: Set<Int>
-    let receivesStopTokens: Bool
-
-    init(additionalStopTokenIDs: Set<Int> = [], receivesStopTokens: Bool = false) {
-        self.additionalStopTokenIDs = additionalStopTokenIDs
-        self.receivesStopTokens = receivesStopTokens
-    }
-
-    mutating func onToken(
-        _ token: Int,
-        emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        if case .terminated = emit(.token(token)) {
-            return .cancelled
-        }
-        return .more
-    }
-
-    mutating func onStopToken(
-        _ token: Int,
-        emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        if case .terminated = emit(.token(token)) {
-            return .cancelled
-        }
-        return .more
-    }
-
-    mutating func onGenerationEnd(
-        emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) {}
-
-    func infoEvent(_ info: GenerateCompletionInfo) -> TokenGeneration {
-        .info(info)
     }
 }

@@ -14,18 +14,22 @@ struct HarmonyStreamAdapter: TokenStreamDecoder {
     let receivesStopTokens = true
     var isInsideReasoning: Bool { parser.isInsideReasoning }
 
+    /// A step can end inside an analysis or public frame, after text that ends in a
+    /// visible character, with no stop-string prefix held back.
+    var canEndForSteering: Bool { router.endsInVisibleText && stopStringFilter.buffer.isEmpty }
+
     init?(
         tokenizer: any Tokenizer,
         tools: [[String: any Sendable]]?,
-        stopStrings: Set<String>
+        stopStrings: Set<String>,
+        toolCallPolicy: ToolCallPolicy = .init()
     ) {
         guard let parser = HarmonyFrameParser(tokenizer: tokenizer) else {
             return nil
         }
         self.parser = parser
         self.router = HarmonyOutputRouter(
-            tokenizer: tokenizer,
-            allowedToolNames: HarmonyOutputRouter.allowedToolNames(from: tools))
+            tokenizer: tokenizer, tools: tools, toolCallPolicy: toolCallPolicy)
         self.stopStringFilter = StopStringFilter(stopStrings: stopStrings)
         self.additionalStopTokenIDs = parser.semanticStopTokenIDs
     }
