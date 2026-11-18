@@ -78,6 +78,24 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         XCTAssertLessThan(localPixels.sum().item(Float.self), -500_000)
     }
 
+    func testGundamTilesRunTopToBottomAsPythonCrops() async throws {
+        let processor = try makeProcessor()
+        // Red top half over a blue bottom half. Core Image puts y = 0 at the bottom.
+        let page = makeSolidImage(width: 400, height: 400, color: .red)
+            .transformed(by: .init(translationX: 0, y: 400))
+            .composited(over: makeSolidImage(width: 400, height: 400, color: .blue))
+        let input = UserInput(prompt: "Describe this page.", images: [.ciImage(page)])
+
+        let prepared = try await processor.internalPrepare(input: input)
+
+        XCTAssertEqual(prepared.imagesSpatialCrop.map { [$0.w, $0.h] }, [[1, 2]])
+        let tiles = prepared.localCrops.asType(.float32)
+        let red = tiles[0..., 0].mean(axes: [1, 2])
+        let blue = tiles[0..., 2].mean(axes: [1, 2])
+        XCTAssertGreaterThan(red[0].item(Float.self), blue[0].item(Float.self))
+        XCTAssertGreaterThan(blue[1].item(Float.self), red[1].item(Float.self))
+    }
+
     func testBaseModeIsSelectableAndUsesSingleViewTokenGrid() async throws {
         let processor = try makeProcessor()
         let input = UserInput(
@@ -212,11 +230,80 @@ final class DeepseekOCRProcessorTests: XCTestCase {
 
         XCTAssertNil(lmInput.image, "a text-only prompt must not fabricate an image")
         XCTAssertNil(lmInput.video)
-        // BOS from the processor, then the template's tokens: a synthetic id per word
-        // and one per whitespace character, including the template's own separator.
-        XCTAssertEqual(lmInput.text.tokens.shape, [1, 5])
-        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self), [0, 20, 900, 22, 900])
-        XCTAssertEqual(lmInput.text.mask?.asArray(Int8.self), [1, 1, 1, 1, 1])
+        // BOS from the processor, then the template's tokens: a synthetic id per word and
+        // one per whitespace character. The template's own trailing separator is rendered and
+        // then dropped again, as mlx-vlm's `process_one` drops it under `inference_mode`.
+        XCTAssertEqual(lmInput.text.tokens.shape, [1, 4])
+        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self), [0, 20, 900, 22])
+        XCTAssertEqual(lmInput.text.mask?.asArray(Int8.self), [1, 1, 1, 1])
+    }
+
+    /// Both packs drop the template's trailing separator: DeepSeek's `process_one` does under
+    /// `inference_mode`, and mlx-vlm and the authors end the Unlimited prompt at the text.
+    func testBothPacksDropTheTemplateSeparator() async throws {
+        let input = UserInput(prompt: "document parsing.")
+
+        let deepseek = try await makeProcessor().prepare(input: input)
+        let unlimited = try await makeUnlimitedProcessor().prepare(input: input)
+
+        let deepseekIds = deepseek.text.tokens.asArray(Int32.self).map(Int.init)
+        XCTAssertEqual(deepseekIds, [0, 20, 900, 22])
+        XCTAssertEqual(unlimited.text.tokens.asArray(Int32.self).map(Int.init), deepseekIds)
+    }
+
+    /// mlx-vlm 0.8.0 ends the Unlimited image prompt at `parsing.` with no separator id.
+    func testUnlimitedImagePromptEndsAtThePromptText() async throws {
+        let input = UserInput(
+            prompt: "document parsing.",
+            images: [.ciImage(makeSolidImage(width: 200, height: 200, color: .red))],
+            additionalContext: DeepseekOCRProcessor.modeContext(.base))
+
+        let prepared = try await makeUnlimitedProcessor().internalPrepare(input: input)
+
+        // `<image>document parsing.`: the lattice's last image id, then `document`, a space
+        // and `parsing.`, as in the probe's `..., 34030, 76466, 16`.
+        let ids = prepared.inputIds.asArray(Int32.self).map(Int.init)
+        XCTAssertEqual(Array(ids.suffix(4)), [999, 21, DeterministicTokenizer.whitespaceId, 23])
+    }
+
+    /// The trim drops only a whitespace separator: a template that renders no trailing space
+    /// keeps its last token in both packs.
+    func testTemplateWithoutTrailingSpaceKeepsItsLastToken() async throws {
+        let tokenizer = DeterministicTokenizer(templateSeparator: "")
+        let input = UserInput(prompt: "document parsing.")
+
+        for processor in [
+            try makeProcessor(tokenizer: tokenizer),
+            try makeUnlimitedProcessor(tokenizer: tokenizer),
+        ] {
+            let prepared = try await processor.prepare(input: input)
+            XCTAssertEqual(prepared.text.tokens.asArray(Int32.self), [0, 20, 900, 22])
+        }
+    }
+
+    /// `processing_unlimitedocr.py:175` passes `max_num=32`, so an Unlimited caller who names
+    /// no cap still gets 32.
+    func testUnlimitedTilesAtItsOwnCapWhenTheCallerNamesNone() async throws {
+        // A 1:10 strip: capped at 9 tiles it cannot cover the page, at 32 it can.
+        let strip = makeSolidImage(width: 640, height: 6400, color: .gray)
+        let input = UserInput(prompt: "document parsing.", images: [.ciImage(strip)])
+
+        let deepseek = try await makeProcessor().internalPrepare(input: input)
+        let unlimited = try await makeUnlimitedProcessor().internalPrepare(input: input)
+
+        XCTAssertEqual(
+            deepseek.localCrops.shape[0], 9,
+            "DeepSeek-OCR's own cap is 9")
+        XCTAssertEqual(
+            unlimited.localCrops.shape[0], 10,
+            "Unlimited-OCR covers the 1:10 strip with ten tiles; DeepSeek's cap stops at nine")
+
+        // The caller still wins over the pack default, in both directions.
+        let capped = UserInput(
+            prompt: "document parsing.", images: [.ciImage(strip)],
+            additionalContext: [DeepseekOCRProcessor.maxNumTilesContextKey: 9])
+        let unlimitedCapped = try await makeUnlimitedProcessor().internalPrepare(input: capped)
+        XCTAssertEqual(unlimitedCapped.localCrops.shape[0], 9)
     }
 
     func testPrepareRejectsVideoInputInsteadOfDroppingIt() async throws {
@@ -265,8 +352,12 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             "the template itself must not carry BOS")
         XCTAssertEqual(ids.first, 7, "BOS comes from the tokenizer, not Python's literal 0")
         XCTAssertEqual(prepared.imagesSeqMask[0, 0].item(Bool.self), false)
-        // Template tokens follow unchanged; only the placeholder expands to the lattice.
-        XCTAssertEqual(ids.filter { $0 != 999 }, [7] + template.filter { $0 != 999 })
+        // Template tokens follow, less the trailing separator the DeepSeek pack trims;
+        // only the placeholder expands to the lattice.
+        XCTAssertEqual(
+            ids.filter { $0 != 999 },
+            [7] + template.filter { $0 != 999 }.dropLast(),
+            "the rendered separator is dropped, every other template token is kept")
         XCTAssertEqual(ids.count(where: { $0 == 999 }), 111)
     }
 
@@ -282,7 +373,9 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         XCTAssertEqual(
             template, [20, 900, 22, 900],
             "the template itself must not carry BOS")
-        XCTAssertEqual(lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7] + template)
+        XCTAssertEqual(
+            lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7] + template.dropLast(),
+            "BOS, the template's tokens, and no trailing separator")
     }
 
     /// mlx-vlm's `deepseekocr` entry is `MessageFormat.IMAGE_TOKEN_NEWLINE`, whose token
@@ -365,6 +458,9 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             tokenizer: DeterministicTokenizer())
         XCTAssertEqual(
             try XCTUnwrap(unlimited as? DeepseekOCRProcessor).imagePlaceholder, .single)
+        XCTAssertEqual(
+            try XCTUnwrap(unlimited as? DeepseekOCRProcessor).defaultMaxNumTiles, 32,
+            "`processing_unlimitedocr.py` hard-codes max_num=32 at its own call site")
 
         for key in ["DeepseekVLV2Processor", "DeepseekOCRProcessor"] {
             let deepseek = try await VLMProcessorTypeRegistry.shared.createModel(
@@ -372,7 +468,21 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             XCTAssertEqual(
                 try XCTUnwrap(deepseek as? DeepseekOCRProcessor).imagePlaceholder,
                 .perImageWithNewline, key)
+            XCTAssertEqual(
+                try XCTUnwrap(deepseek as? DeepseekOCRProcessor).defaultMaxNumTiles, 9, key)
         }
+    }
+
+    /// The `.unlimited` factory carries Unlimited-OCR's two pack rules and the plain init
+    /// carries DeepSeek-OCR's, without going through the registry.
+    func testUnlimitedFactoryAndPlainInitCarryTheirPackRules() throws {
+        let unlimited = try makeUnlimitedProcessor()
+        XCTAssertEqual(unlimited.imagePlaceholder, .single)
+        XCTAssertEqual(unlimited.defaultMaxNumTiles, 32)
+
+        let deepseek = try makeProcessor()
+        XCTAssertEqual(deepseek.imagePlaceholder, .perImageWithNewline)
+        XCTAssertEqual(deepseek.defaultMaxNumTiles, 9)
     }
 
     /// `chatTemplateTokens` hands the processor's own `imagePlaceholder` to the message
@@ -401,13 +511,14 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             "one template render, carrying exactly one <image> for two pages")
         XCTAssertEqual(unlimited.pixelValues.shape, [2, 3, 1024, 1024])
         XCTAssertEqual(unlimited.imagesSeqMask.asType(.int32).sum().item(Int.self), 546)
+        // The DeepSeek shape adds one newline token per page; both packs drop the separator.
         XCTAssertEqual(
             deepseek.inputIds.shape[1] - unlimited.inputIds.shape[1], 2,
-            "the DeepSeek shape carries one newline token per page; Unlimited carries none")
-        let newlines = { (ids: MLXArray) in
+            "the two DeepSeek newline tokens")
+        let whitespace = { (ids: MLXArray) in
             ids.asArray(Int32.self).count(where: { $0 == DeterministicTokenizer.whitespaceId })
         }
-        XCTAssertEqual(newlines(deepseek.inputIds) - newlines(unlimited.inputIds), 2)
+        XCTAssertEqual(whitespace(deepseek.inputIds) - whitespace(unlimited.inputIds), 2)
     }
 
     /// The registry default prompt carries no trailing space: the pack template appends
@@ -441,7 +552,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         let lmInput = try await processor.prepare(input: input)
 
         XCTAssertEqual(
-            lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7, 20, 900, 22, 900])
+            lmInput.text.tokens.asArray(Int32.self).map(Int.init), [7, 20, 900, 22])
     }
 
     /// Python hard-codes `bos_id = 0`; that literal is the fallback for a tokenizer that
@@ -453,7 +564,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         let lmInput = try await processor.prepare(input: input)
 
         XCTAssertEqual(
-            lmInput.text.tokens.asArray(Int32.self).map(Int.init), [0, 20, 900, 22, 900])
+            lmInput.text.tokens.asArray(Int32.self).map(Int.init), [0, 20, 900, 22])
     }
 
     /// End to end: a text-only prompt prefilled through the model (R-SWA ring caches, as on
@@ -476,8 +587,8 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         eval(output.logits)
 
         XCTAssertEqual(probe.callCount, 0, "text-only prefill must not run the vision tower")
-        XCTAssertEqual(output.logits.shape, [1, 5, 32])
-        XCTAssertEqual(cache.first?.offset, 5)
+        XCTAssertEqual(output.logits.shape, [1, 4, 32])
+        XCTAssertEqual(cache.first?.offset, 4)
 
         let direct = model(
             LMInput.Text(tokens: lmInput.text.tokens),
@@ -499,14 +610,16 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             Set(["gundam", "base"]))
         XCTAssertEqual(DeepseekOCRProcessor.maxNumTiles(from: nil), 9)
         XCTAssertEqual(
+            DeepseekOCRProcessor.maxNumTiles(from: nil, default: 32), 32,
+            "the pack's own cap is the fallback when the caller names none")
+        XCTAssertEqual(
+            DeepseekOCRProcessor.maxNumTiles(
+                from: [DeepseekOCRProcessor.maxNumTilesContextKey: 4], default: 32), 4,
+            "a caller who names a cap still wins")
+        XCTAssertEqual(
             DeepseekOCRProcessor.maxNumTiles(from: [
                 DeepseekOCRProcessor.maxNumTilesContextKey: 32
             ]), 32)
-        XCTAssertEqual(
-            DeepseekOCRProcessor.mode(from: DeepseekOCRProcessor.unlimitedContext(.base)), .base)
-        XCTAssertEqual(
-            DeepseekOCRProcessor.maxNumTiles(from: DeepseekOCRProcessor.unlimitedContext(.base)),
-            32)
     }
 
     func testMultipageFusedBasePrepareStacksPagesAndLattices() async throws {
@@ -627,8 +740,77 @@ final class DeepseekOCRProcessorTests: XCTestCase {
             boxes,
             [
                 .init(x1: 330, y1: 198, x2: 558, y2: 230),
-                .init(x1: 10, y1: 20, x2: 30, y2: 40),
+                .init(x1: 10, y1: 20, x2: 30, y2: 40, label: "body"),
+            ],
+            "the grounding form's `<|ref|>` span is the box's label; an orphan close carries none"
+        )
+    }
+
+    /// Unlimited-OCR's layout names the type inside the det span and uses one bracket:
+    /// `<|det|>footer [x1, y1, x2, y2]<|/det|>`.
+    func testParseDetectionsReadsUnlimitedLayoutSpans() {
+        let sample =
+            #"<|det|>header [115, 115, 375, 127]<|/det|>Green Valley"#
+            + "\n"
+            + #"<|det|>footer [137, 878, 332, 890]<|/det|>Thank you"#
+
+        let boxes = DeepseekOCRSpecialTokens.parseDetections(from: sample)
+
+        XCTAssertEqual(
+            boxes,
+            [
+                .init(x1: 115, y1: 115, x2: 375, y2: 127, label: "header"),
+                .init(x1: 137, y1: 878, x2: 332, y2: 890, label: "footer"),
             ])
+    }
+
+    /// The authors' extractor reads a det span as a list of boxes, so every box is returned,
+    /// each with the span's label.
+    func testParseDetectionsReadsEveryBoxInAMultiBoxSpan() {
+        let grounding = #"<|ref|>cat<|/ref|><|det|>[[1, 2, 3, 4], [5, 6, 7, 8]]<|/det|>"#
+        XCTAssertEqual(
+            DeepseekOCRSpecialTokens.parseDetections(from: grounding),
+            [
+                .init(x1: 1, y1: 2, x2: 3, y2: 4, label: "cat"),
+                .init(x1: 5, y1: 6, x2: 7, y2: 8, label: "cat"),
+            ])
+
+        let layout = #"<|det|>text [1, 2, 3, 4], [5, 6, 7, 8]<|/det|>"#
+        XCTAssertEqual(
+            DeepseekOCRSpecialTokens.parseDetections(from: layout),
+            [
+                .init(x1: 1, y1: 2, x2: 3, y2: 4, label: "text"),
+                .init(x1: 5, y1: 6, x2: 7, y2: 8, label: "text"),
+            ])
+    }
+
+    /// A span cut off at the token cap has no `<|/det|>`; bracketed text after its boxes is
+    /// transcription, not boxes.
+    func testParseDetectionsStopsAnUnclosedSpanAtItsBoxes() {
+        let truncated = #"<|det|>text [10, 20, 30, 40] The matrix [1, 2, 3, 4] follows."#
+        XCTAssertEqual(
+            DeepseekOCRSpecialTokens.parseDetections(from: truncated),
+            [.init(x1: 10, y1: 20, x2: 30, y2: 40, label: "text")])
+    }
+
+    /// One document may carry both shapes, and output whose special tokens were stripped
+    /// carries neither. Every box is read exactly once, in the order the model emitted it.
+    func testParseDetectionsReadsBothShapesInEmissionOrderWithoutDoubleCounting() {
+        let sample =
+            #"<|det|>title [1, 2, 3, 4]<|/det|>"#
+            + #"<|ref|>text<|/ref|><|det|>[[5, 6, 7, 8]]<|/det|>"#
+            + #"tail [[9, 10, 11, 12]]"#
+
+        let boxes = DeepseekOCRSpecialTokens.parseDetections(from: sample)
+
+        XCTAssertEqual(
+            boxes,
+            [
+                .init(x1: 1, y1: 2, x2: 3, y2: 4, label: "title"),
+                .init(x1: 5, y1: 6, x2: 7, y2: 8, label: "text"),
+                .init(x1: 9, y1: 10, x2: 11, y2: 12),
+            ])
+        XCTAssertEqual(boxes.count, 3, "the double-bracket box must not be counted twice")
     }
 
     private func makeProcessor(tokenizer: any Tokenizer = DeterministicTokenizer()) throws
@@ -646,7 +828,7 @@ final class DeepseekOCRProcessorTests: XCTestCase {
         let config = try JSONDecoder().decode(
             UnlimitedOCRProcessorConfiguration.self,
             from: Data(Self.processorConfigJSON.utf8))
-        return DeepseekOCRProcessor(config, tokenizer: tokenizer, imagePlaceholder: .single)
+        return DeepseekOCRProcessor.unlimited(config, tokenizer: tokenizer)
     }
 
     private func makeSolidImage(width: CGFloat, height: CGFloat, color: CIColor) -> CIImage {
@@ -752,6 +934,9 @@ private struct DeterministicTokenizer: Tokenizer {
     /// swift-transformers encodes the rendered template with `addSpecialTokens: false`.
     var templateEmitsBOS = false
 
+    /// What the chat template renders after the message content.
+    var templateSeparator = " "
+
     /// Emitted once per whitespace character so assertions can see separators.
     static let whitespaceId = 900
 
@@ -799,7 +984,9 @@ private struct DeterministicTokenizer: Tokenizer {
         return ids
     }
 
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map { $0 == Self.whitespaceId ? " " : "w" }.joined()
+    }
 
     func convertTokenToId(_ token: String) -> Int? {
         if let special = DeepseekOCRSpecialTokens(rawValue: token) {
@@ -834,7 +1021,8 @@ private struct DeterministicTokenizer: Tokenizer {
                 // Both packs' chat_template.jinja is `{{message['content']}} ` -- the
                 // separator is part of the template, and is why a prompt that already
                 // ends in a space double-spaces the rendered result.
-                ids.append(contentsOf: encode(text: content + " ", addSpecialTokens: false))
+                ids.append(
+                    contentsOf: encode(text: content + templateSeparator, addSpecialTokens: false))
             }
         }
         return ids
@@ -846,7 +1034,10 @@ private struct DeterministicTokenizer: Tokenizer {
 /// placeholder is fanned out to lattice positions.
 private final class PromptRecordingTokenizer: Tokenizer, @unchecked Sendable {
     private let inner = DeterministicTokenizer()
-    private(set) var renderedContents = [String]()
+    private let lock = NSLock()
+    private var _renderedContents = [String]()
+
+    var renderedContents: [String] { lock.withLock { _renderedContents } }
 
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
         inner.encode(text: text, addSpecialTokens: addSpecialTokens)
@@ -865,8 +1056,10 @@ private final class PromptRecordingTokenizer: Tokenizer, @unchecked Sendable {
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
-        renderedContents.append(
-            contentsOf: messages.compactMap { $0["content"] as? String })
+        lock.withLock {
+            _renderedContents.append(
+                contentsOf: messages.compactMap { $0["content"] as? String })
+        }
         return try inner.applyChatTemplate(
             messages: messages, tools: tools, additionalContext: additionalContext)
     }

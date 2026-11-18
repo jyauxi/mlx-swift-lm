@@ -94,15 +94,55 @@ final class VLMRegistryTests: XCTestCase {
                 XCTAssertEqual(ring.windowSize, 128)
             }
         }
-        XCTAssertEqual(VLMRegistry.unlimitedOCR6bit.name, "majentik/Unlimited-OCR-MLX-6bit")
+        XCTAssertEqual(VLMRegistry.unlimitedOCR6bit.name, "mlx-community/Unlimited-OCR-6bit")
     }
 
-    func testUnlimitedOCRProcessorAliasLoadsPinnedHFConfig() async throws {
+    /// Unlimited-OCR-2 keeps `model_type: unlimited-ocr` but adds sparse attention, which
+    /// this port does not build, so its config must fail to load instead of running as v1.
+    func testUnlimitedOCR2ConfigIsRefused() async throws {
+        let sparseKeys: [String: Any] = [
+            "use_sparse_attention": true, "sparse_attention_config": [String: Any](),
+        ]
+        for (key, value) in sparseKeys {
+            var json = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(Self.unlimitedOCRConfig.utf8))
+                    as? [String: Any])
+            json[key] = value
+            let data = try JSONSerialization.data(withJSONObject: json)
+            for modelType in ["unlimited-ocr", "unlimited_ocr"] {
+                do {
+                    _ = try await VLMTypeRegistry.shared.createModel(
+                        configuration: data, modelType: modelType)
+                    XCTFail("\(modelType) with \(key) must not load")
+                } catch {
+                    XCTAssertTrue(
+                        "\(error)".contains("Unlimited-OCR-2 is not supported"), "\(error)")
+                }
+            }
+        }
+
+        // The shipped v1 and DeepSeek configs still decode.
+        for config in [Self.unlimitedOCRConfig, Self.deepseekOCRConfig] {
+            XCTAssertNoThrow(
+                try JSONDecoder().decode(DeepseekOCRConfiguration.self, from: Data(config.utf8)))
+        }
+    }
+
+    /// A section that is present but null is not a sparse-attention config.
+    func testNullTextSectionStillDecodes() throws {
+        var json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(Self.unlimitedOCRConfig.utf8))
+                as? [String: Any])
+        json["text_config"] = NSNull()
+        let data = try JSONSerialization.data(withJSONObject: json)
+        XCTAssertNoThrow(try JSONDecoder().decode(DeepseekOCRConfiguration.self, from: data))
+    }
+
+    func testUnlimitedOCRProcessorKeyLoadsPinnedHFConfig() async throws {
         let processor = try await VLMProcessorTypeRegistry.shared.createModel(
             configuration: Self.unlimitedOCRProcessorConfig.data(using: .utf8)!,
             processorType: "UnlimitedOCRProcessor",
             tokenizer: StubTokenizer())
-        XCTAssertTrue(processor is UnlimitedOCRProcessor)
         XCTAssertTrue(processor is DeepseekOCRProcessor)
         let decoded = try JSONDecoder().decode(
             UnlimitedOCRProcessorConfiguration.self,
@@ -156,6 +196,29 @@ final class VLMRegistryTests: XCTestCase {
         let selected = try await Self.selectedModelType(factory: factory, directory: directory)
         XCTAssertEqual(selected, "unlimited-ocr")
 
+        let model = try await VLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: selected)
+        XCTAssertTrue(model is UnlimitedOCR, "\(selected) built \(type(of: model))")
+    }
+
+    /// The registered `mlx-community/Unlimited-OCR-6bit` pack ships the native type.
+    func testNativeUnlimitedPackSelectsTheUnlimitedCreatorThroughTheFactory() async throws {
+        var json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(Self.unlimitedOCRConfig.utf8)) as? [String: Any]
+        )
+        json["model_type"] = "unlimited-ocr"
+        json["_orig_model_type"] = nil
+        let data = try JSONSerialization.data(withJSONObject: json)
+        let factory = Self.makeProbeFactory(
+            registeredTypes: ["deepseekocr", "unlimited-ocr", "unlimited_ocr"],
+            honorOrigModelType: false)
+
+        let directory = try Self.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try data.write(to: directory.appendingPathComponent("config.json"))
+
+        let selected = try await Self.selectedModelType(factory: factory, directory: directory)
+        XCTAssertEqual(selected, "unlimited-ocr")
         let model = try await VLMTypeRegistry.shared.createModel(
             configuration: data, modelType: selected)
         XCTAssertTrue(model is UnlimitedOCR, "\(selected) built \(type(of: model))")
@@ -452,10 +515,9 @@ extension VLMRegistryTests {
         }
         """#
 
-    /// The shipped `majentik/Unlimited-OCR-MLX-6bit` shape, verbatim in the fields that
-    /// decide routing: `model_type: deepseekocr` with `_orig_model_type: unlimited-ocr`.
-    /// No published pack carries `model_type: unlimited-ocr`; the registry keys for it
-    /// exist for callers that pass the type by hand.
+    /// The `majentik/Unlimited-OCR-MLX-6bit` shape, verbatim in the fields that decide
+    /// routing: `model_type: deepseekocr` with `_orig_model_type: unlimited-ocr`.
+    /// `mlx-community/Unlimited-OCR-6bit` ships `model_type: unlimited-ocr` instead.
     fileprivate static let unlimitedOCRConfig = #"""
         {
          "architectures": [

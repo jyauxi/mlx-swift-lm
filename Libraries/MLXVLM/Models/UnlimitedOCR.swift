@@ -18,25 +18,19 @@ public typealias UnlimitedOCRConfiguration = DeepseekOCRConfiguration
 /// `preprocessor_config.json` schema as DeepSeek-OCR.
 public typealias UnlimitedOCRProcessorConfiguration = DeepseekOCRProcessorConfiguration
 
-/// Processor for Unlimited-OCR.
-///
-/// Python `processing_unlimitedocr.py` subclasses DeepseekOCRProcessor with
-/// torch-free `from_pretrained`, default `sft_format="unlimitedocr"`,
-/// `max_num=32` tiling, and multipage single-`<image>` support. Comparing the
-/// two processors tensor-by-tensor showed the single-page inference templates
-/// are identical, so a distinct Swift type would carry no behavior — hence a
-/// typealias rather than a subclass. In this port's processors the packs differ
-/// only in the prompt's placeholder shape, which mlx-vlm decides outside the
-/// processor (`prompt_utils.py` `MODEL_CONFIG`, keyed on `model_type`); the
-/// `UnlimitedOCRProcessor` registry key builds the shared processor with
-/// ``DeepseekOCRProcessor/init(_:tokenizer:imagePlaceholder:)`` and `.single`,
-/// Unlimited's one bare `<image>`.
-///
-/// Multipage fused prepare (`Multi page parsing.`, base mode) and optional
-/// `max_num=32` live on the shared processor: pass multiple `UserInput.Image`s
-/// and ``DeepseekOCRProcessor/modeContext(_:)`` `.base`, or
-/// ``DeepseekOCRProcessor/unlimitedContext(_:)`` for Unlimited tiling.
-public typealias UnlimitedOCRProcessor = DeepseekOCRProcessor
+extension DeepseekOCRProcessor {
+    /// The Unlimited-OCR processor: the DeepSeek-OCR pipeline with Unlimited's two pack rules.
+    ///
+    /// One bare `<image>` whatever the page count (`prompt_utils.py:93`), and a 32-tile gundam
+    /// cap (`processing_unlimitedocr.py:175`).
+    public static func unlimited(
+        _ config: UnlimitedOCRProcessorConfiguration, tokenizer: any Tokenizer
+    ) -> DeepseekOCRProcessor {
+        DeepseekOCRProcessor(
+            config, tokenizer: tokenizer, imagePlaceholder: .single,
+            defaultMaxNumTiles: unlimitedMaxNumTiles)
+    }
+}
 
 /// Unlimited-OCR VLM: DeepSeek-OCR weights + R-SWA decode cache.
 ///

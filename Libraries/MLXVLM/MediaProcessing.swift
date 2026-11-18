@@ -404,7 +404,7 @@ public enum MediaProcessing {
         maxFrames: Int = Int.max,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
-        switch video {
+        switch video.source {
         case .avAsset(let asset):
             try await Self.validateAsset(asset)
             return try await _asProcessedSequence(
@@ -580,7 +580,9 @@ public enum MediaProcessing {
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
 
-        precondition(!videoFrames.isEmpty)
+        guard !videoFrames.isEmpty else {
+            throw VLMError.processing("Video frame input must contain at least one frame.")
+        }
 
         let startTime = videoFrames.first?.timeStamp ?? .zero
         let endTime = videoFrames.last?.timeStamp ?? .zero
@@ -631,6 +633,39 @@ public enum MediaProcessing {
             timestamps: timestamps,
             totalDuration: duration
         )
+    }
+}
+
+// MARK: - Antialiased Bicubic
+
+extension MediaProcessing {
+
+    /// `[output, input]` weights of the antialiased bicubic filter (a = -0.5) of Pillow and
+    /// PyTorch's `interpolate(mode: "bicubic", antialias: true)`.
+    static func antialiasedBicubicWeights(input: Int, output: Int) -> MLXArray {
+        let scale = Double(input) / Double(output)
+        let filterScale = max(scale, 1)
+        let support = 2 * filterScale
+        var weights = [Float](repeating: 0, count: output * input)
+        for row in 0 ..< output {
+            let center = (Double(row) + 0.5) * scale
+            let first = max(Int(center - support + 0.5), 0)
+            let last = min(Int(center + support + 0.5), input)
+            let taps = (first ..< last).map { cubic((Double($0) - center + 0.5) / filterScale) }
+            let total = taps.reduce(0, +)
+            for (offset, tap) in taps.enumerated() where total != 0 {
+                weights[row * input + first + offset] = Float(tap / total)
+            }
+        }
+        return MLXArray(weights, [output, input])
+    }
+
+    private static func cubic(_ x: Double) -> Double {
+        let a = -0.5
+        let x = abs(x)
+        if x < 1 { return ((a + 2) * x - (a + 3)) * x * x + 1 }
+        if x < 2 { return (((x - 5) * x + 8) * x - 4) * a }
+        return 0
     }
 }
 

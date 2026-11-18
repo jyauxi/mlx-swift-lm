@@ -123,7 +123,7 @@ enum KVCacheTree {
         for index in cache.indices {
             if let list = cache[index] as? CacheList {
                 list.rewriteLeaves(path: [index], using: transform)
-            } else {
+            } else if !(cache[index] is any AuxiliaryKVCache) {
                 let leaf = KVCacheLeaf(path: [index], cache: cache[index])
                 cache[index] = transform(leaf)
             }
@@ -157,7 +157,7 @@ enum KVCacheTree {
             for (index, child) in list.children.enumerated() {
                 appendLeaves(from: child, path: path + [index], to: &leaves)
             }
-        } else {
+        } else if !(cache is any AuxiliaryKVCache) {
             leaves.append(KVCacheLeaf(path: path, cache: cache))
         }
     }

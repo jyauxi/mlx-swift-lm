@@ -219,10 +219,23 @@ public struct DeepseekOCRConfiguration: Decodable, Sendable {
         case _imageSeqLength = "image_seq_length"
         case _topLevelSlidingWindowSize = "sliding_window_size"
         case _topLevelSlidingWindow = "sliding_window"
+        case useSparseAttention = "use_sparse_attention"
+        case sparseAttentionConfig = "sparse_attention_config"
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        // Unlimited-OCR-2 keeps `model_type: unlimited-ocr` but adds sparse attention, which
+        // this port does not build.
+        let sections = try [CodingKeys.textConfiguration, .languageConfiguration]
+            .filter { try container.contains($0) && !container.decodeNil(forKey: $0) }
+            .map { try container.nestedContainer(keyedBy: CodingKeys.self, forKey: $0) }
+        if ([container] + sections).contains(where: {
+            $0.contains(.useSparseAttention) || $0.contains(.sparseAttentionConfig)
+        }) {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: [], debugDescription: "Unlimited-OCR-2 is not supported."))
+        }
         self.visionConfiguration = try container.decode(
             VisionConfiguration.self, forKey: .visionConfiguration)
         if let text = try container.decodeIfPresent(
@@ -401,38 +414,77 @@ public enum DeepseekOCRSpecialTokens: String, Sendable, CaseIterable {
         "Locate \(Self.refOpen.rawValue)\(text)\(Self.refClose.rawValue) in the image."
     }
 
-    /// Normalized 0–1000 axis-aligned box from a `<|det|>[[x1, y1, x2, y2]]` span.
+    /// Normalized 0–1000 axis-aligned box from a `<|det|>` span, carrying the layout label
+    /// when the model named one.
     public struct Detection: Equatable, Sendable {
         public let x1: Int
         public let y1: Int
         public let x2: Int
         public let y2: Int
+        /// The layout type the span named (`title`, `header`, `footer`, `text`, …), from
+        /// DeepSeek-OCR's `<|ref|>` span or from Unlimited-OCR's in-span label. `nil` when the
+        /// span carried none.
+        public let label: String?
 
-        public init(x1: Int, y1: Int, x2: Int, y2: Int) {
+        public init(x1: Int, y1: Int, x2: Int, y2: Int, label: String? = nil) {
             self.x1 = x1
             self.y1 = y1
             self.x2 = x2
             self.y2 = y2
+            self.label = label
         }
     }
 
-    /// Extract `[[x1,y1,x2,y2]]` boxes from model output that still contains special tokens.
-    /// Does **not** rebuild a layout tree — see type-level deferral note.
+    /// Extract layout boxes from output that still has special tokens: every `[x1,y1,x2,y2]`
+    /// in `<|ref|>label<|/ref|><|det|>[[…], …]<|/det|>`, `<|det|>label […], …<|/det|>` or a
+    /// bare `[[…]]`, in emission order, each with its span's label.
     public static func parseDetections(from text: String) -> [Detection] {
-        // Match [[a, b, c, d]] (as emitted inside <|det|>…<|/det|>).
-        let pattern =
-            #"\[\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]\]"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let box = #"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]"#
+        let plainBox = #"\[\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\]"#
+        let spanned =
+            #"(?:<\|ref\|>\s*([^<]*?)\s*<\|/ref\|>\s*)?<\|det\|>([^\[<]*\[[\[\]\d\s,]*\])"#
+        let bare = #"\[\s*"# + plainBox + #"(?:\s*,\s*"# + plainBox + #")*\s*\]"#
+        guard let boxRegex = try? NSRegularExpression(pattern: box),
+            let spanRegex = try? NSRegularExpression(pattern: spanned),
+            let bareRegex = try? NSRegularExpression(pattern: bare)
+        else { return [] }
+
         let ns = text as NSString
-        let range = NSRange(location: 0, length: ns.length)
-        return regex.matches(in: text, range: range).compactMap { match in
-            guard match.numberOfRanges == 5 else { return nil }
-            let ints = (1 ... 4).compactMap { i -> Int? in
-                Int(ns.substring(with: match.range(at: i)))
-            }
-            guard ints.count == 4 else { return nil }
-            return Detection(x1: ints[0], y1: ints[1], x2: ints[2], y2: ints[3])
+        let whole = NSRange(location: 0, length: ns.length)
+        func trimmed(_ value: String) -> String? {
+            let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
         }
+        func boxes(in range: NSRange, label: String?) -> [(location: Int, detection: Detection)] {
+            boxRegex.matches(in: text, range: range).compactMap { match in
+                let values = (1 ... 4).compactMap { Int(ns.substring(with: match.range(at: $0))) }
+                guard values.count == 4 else { return nil }
+                return (
+                    match.range.location,
+                    Detection(
+                        x1: values[0], y1: values[1], x2: values[2], y2: values[3], label: label)
+                )
+            }
+        }
+
+        var spans: [NSRange] = []
+        var found: [(location: Int, detection: Detection)] = []
+        for match in spanRegex.matches(in: text, range: whole) {
+            let refRange = match.range(at: 1)
+            let body = ns.substring(with: match.range(at: 2))
+            let label =
+                (refRange.location != NSNotFound ? trimmed(ns.substring(with: refRange)) : nil)
+                ?? body.components(separatedBy: "[").first.flatMap(trimmed)
+            let spanBoxes = boxes(in: match.range(at: 2), label: label)
+            guard !spanBoxes.isEmpty else { continue }
+            spans.append(match.range)
+            found += spanBoxes
+        }
+        for match in bareRegex.matches(in: text, range: whole)
+        where !spans.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) {
+            found += boxes(in: match.range, label: nil)
+        }
+        return found.sorted { $0.location < $1.location }.map(\.detection)
     }
 }
 
@@ -440,23 +492,14 @@ public enum DeepseekOCRSpecialTokens: String, Sendable, CaseIterable {
 ///
 /// These checkpoints render `message.content` directly, so image placeholders must be
 /// embedded in string content rather than represented as Qwen-style structured parts.
-/// The two packs spell that placeholder differently; ``ImagePlaceholder`` carries the
-/// choice so the pack that built the processor decides, not the caller.
 public struct DeepseekOCRMessageGenerator: MessageGenerator {
 
-    /// How image placeholders are prefixed to the user content.
-    ///
-    /// mlx-vlm keys this on `model_type` (`prompt_utils.py`, `MODEL_CONFIG`): the two OCR
-    /// packs share a processor but not a prompt shape, and the difference is a token in
-    /// its own right, so the wrong shape shifts every position after the image lattice
-    /// relative to the Python reference.
+    /// How image placeholders prefix the user content; mlx-vlm keys this on `model_type`
+    /// (`prompt_utils.py` `MODEL_CONFIG`).
     public enum ImagePlaceholder: Sendable {
-        /// `deepseekocr` → `MessageFormat.IMAGE_TOKEN_NEWLINE`: the token is `"<image>\n"`
-        /// and the prefix is `token * num_images`, one per image.
+        /// `deepseekocr` (`IMAGE_TOKEN_NEWLINE`): `"<image>\n"` once per image.
         case perImageWithNewline
-        /// `unlimited-ocr` → `MessageFormat.SINGLE_IMAGE_TOKEN`: a bare `"<image>"` emitted
-        /// once whatever the image count (`repeat_image_token=False`). The processor fans
-        /// that one placeholder out to every page.
+        /// `unlimited-ocr` (`SINGLE_IMAGE_TOKEN`): one bare `"<image>"` whatever the image count.
         case single
     }
 
@@ -517,16 +560,13 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
         case base
     }
 
-    /// Unlimited-OCR gundam tiling cap (`dynamic_preprocess` `max_num=32`).
-    /// DeepSeek-OCR Python uses `9`; Unlimited raises the ceiling for extreme
-    /// aspect ratios. Shared via ``UnlimitedOCRProcessor`` typealias.
+    /// Unlimited-OCR gundam tiling cap (`processing_unlimitedocr.py:175`).
     public static let unlimitedMaxNumTiles = 32
 
     /// DeepSeek-OCR default gundam tiling cap (`max_num=9`).
     public static let deepseekMaxNumTiles = 9
 
-    /// `UserInput.additionalContext` key for gundam `max_num` (Int).
-    /// Missing → ``deepseekMaxNumTiles``; Unlimited multipage/smoke may set 32.
+    /// `UserInput.additionalContext` key overriding the pack's gundam tile cap (Int, at least 2).
     public static let maxNumTilesContextKey = "deepseekocr_max_num_tiles"
 
     @_spi(Testing)
@@ -561,8 +601,10 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
         return mode
     }
 
-    /// Resolves gundam `max_num` from additional context (default DeepSeek 9).
-    public static func maxNumTiles(from additionalContext: [String: any Sendable]?) -> Int {
+    /// Resolves gundam `max_num` from ``maxNumTilesContextKey``, falling back to `default`.
+    public static func maxNumTiles(
+        from additionalContext: [String: any Sendable]?, default fallback: Int = deepseekMaxNumTiles
+    ) -> Int {
         if let value = additionalContext?[maxNumTilesContextKey] as? Int, value >= 2 {
             return value
         }
@@ -571,33 +613,32 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
         {
             return value
         }
-        return deepseekMaxNumTiles
-    }
-
-    /// Context selecting Unlimited-OCR tiling (`max_num=32`) plus optional mode.
-    public static func unlimitedContext(_ mode: Mode = .gundam) -> [String: any Sendable] {
-        modeContext(mode).merging([maxNumTilesContextKey: unlimitedMaxNumTiles]) { _, new in new }
+        return fallback
     }
 
     private let config: DeepseekOCRProcessorConfiguration
     private let tokenizer: any Tokenizer
-    /// The placeholder shape this processor's prompts carry; chosen by the pack that
-    /// built it (see ``DeepseekOCRMessageGenerator/ImagePlaceholder``).
-    public let imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder
+    /// Prompt placeholder shape, chosen by the pack.
+    let imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder
+    /// Gundam tile cap when the caller names none: 9 for DeepSeek-OCR, 32 for Unlimited-OCR
+    /// (`processing_unlimitedocr.py:175`).
+    let defaultMaxNumTiles: Int
 
-    /// - Parameters:
-    ///   - config: the pack's `preprocessor_config.json`.
-    ///   - tokenizer: the pack's tokenizer, which renders the chat template.
-    ///   - imagePlaceholder: the prompt's placeholder shape. Defaults to DeepSeek-OCR's
-    ///     `<image>\n` per image; the `UnlimitedOCRProcessor` registry key passes
-    ///     `.single` for Unlimited-OCR's one bare `<image>`.
-    public init(
+    /// The DeepSeek-OCR processor. Unlimited-OCR packs use ``unlimited(_:tokenizer:)``.
+    public init(_ config: DeepseekOCRProcessorConfiguration, tokenizer: any Tokenizer) {
+        self.init(
+            config, tokenizer: tokenizer, imagePlaceholder: .perImageWithNewline,
+            defaultMaxNumTiles: Self.deepseekMaxNumTiles)
+    }
+
+    init(
         _ config: DeepseekOCRProcessorConfiguration, tokenizer: any Tokenizer,
-        imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder = .perImageWithNewline
+        imagePlaceholder: DeepseekOCRMessageGenerator.ImagePlaceholder, defaultMaxNumTiles: Int
     ) {
         self.config = config
         self.tokenizer = tokenizer
         self.imagePlaceholder = imagePlaceholder
+        self.defaultMaxNumTiles = defaultMaxNumTiles
     }
 
     private func preprocess(image: CIImage, side: Int) -> MLXArray {
@@ -809,7 +850,8 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
         var processed = [MLXArray]()
         for block in 0 ..< (tilesWide * tilesHigh) {
             let x = (block % tilesWide) * tileSize
-            let y = (block / tilesWide) * tileSize
+            // Python crops rows from the top; Core Image puts y = 0 at the bottom.
+            let y = (tilesHigh - 1 - block / tilesWide) * tileSize
             let cropRect = CGRect(x: x, y: y, width: tileSize, height: tileSize)
             let crop =
                 resized
@@ -872,6 +914,14 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
         if promptTokens.first != bosId {
             promptTokens.insert(bosId, at: 0)
         }
+        // Both packs end the prompt at its text: drop the template's trailing separator, as
+        // DeepSeek's `process_one` does, but keep a last token that is not whitespace.
+        if promptTokens.count > 1, let last = promptTokens.last {
+            let text = tokenizer.decode(tokenIds: [last], skipSpecialTokens: false)
+            if !text.isEmpty, text.allSatisfy(\.isWhitespace) {
+                promptTokens.removeLast()
+            }
+        }
         return promptTokens
     }
 
@@ -888,7 +938,8 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
         let promptTokens = try chatTemplateTokens(for: input)
 
         let mode = promptMode(from: input)
-        let maxNumTiles = Self.maxNumTiles(from: input.additionalContext)
+        let maxNumTiles = Self.maxNumTiles(
+            from: input.additionalContext, default: defaultMaxNumTiles)
         // Unlimited multipage/PDF base mode pads each page to 1024² (273 tokens).
         // Single-page DeepSeek `MODE=base` stays 640², matching the Python
         // reference — widening it here would change single-page output.
@@ -1088,6 +1139,8 @@ public class DeepseekOCR: Module, VLMModel, KVCacheDimensionProvider {
         } else {
             embeddings = languageModel.embedTokens(input.text.tokens)
         }
+        // Single forward on purpose: chunk boundaries change SDPA reduction order and move
+        // greedy output on long fused documents; see PR 473.
         let logits = computeLogits(languageModel.forward(embeddings, cache: cache))
         prefill.progress?(embeddings.dim(1), embeddings.dim(1))
         return .logits(LMOutput(logits: logits, state: state ?? .init()))
@@ -1372,6 +1425,25 @@ public class DeepseekOCR: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     @_spi(Testing)
+    public func clipFeedForwardForTesting(_ x: MLXArray) -> MLXArray {
+        clipModel.transformer.layers[0].mlp(x)
+    }
+
+    /// The CLIP position embedding resized to a `gridSize` × `gridSize` patch grid.
+    @_spi(Testing)
+    public func clipPositionEmbeddingForTesting(gridSize: Int) -> MLXArray {
+        clipModel.embeddings.resizedPositionEmbedding(targetSize: gridSize * gridSize + 1)
+    }
+
+    /// The SAM absolute position embedding resized to a `gridSize` × `gridSize` patch grid.
+    @_spi(Testing)
+    public func samPositionEmbeddingForTesting(gridSize: Int) -> MLXArray? {
+        samModel.posEmbed.map {
+            samModel.interpolatedPositionalEmbedding($0, height: gridSize, width: gridSize)
+        }
+    }
+
+    @_spi(Testing)
     public func routeLayerForTesting(_ hiddenStates: MLXArray, layerIndex: Int) -> (
         MLXArray, MLXArray
     )? {
@@ -1485,6 +1557,7 @@ private final class MoEGate: Module {
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let (batchSize, sequenceLength, _) = (x.dim(0), x.dim(1), x.dim(2))
+        // Authors' float32 gate (modeling_deepseekv2.py); mlx-vlm uses the activation dtype.
         let gates = matmul(x.asType(.float32), weight.T.asType(.float32))
         let scores: MLXArray
         switch scoringFunc {
@@ -1655,6 +1728,18 @@ private final class VisionMLP: Module {
     }
 }
 
+/// Resizes `[L, C]` relative positions to `length` rows with half-pixel linear interpolation,
+/// as the authors' `F.interpolate(mode="linear")` does (`deepencoder.py`).
+func resizedRelativePositions(_ relPos: MLXArray, length: Int) -> MLXArray {
+    guard relPos.dim(0) != length else { return relPos }
+    let scale = Float(length) / Float(relPos.dim(0))
+    // Upsample returns float32; cast back as mlx-vlm does, so the attention bias keeps the
+    // query's dtype.
+    return Upsample(scaleFactor: [scale], mode: .linear(alignCorners: false))(
+        relPos.expandedDimensions(axis: 0)
+    ).squeezed(axis: 0).asType(relPos.dtype)
+}
+
 private final class VisionAttention: Module {
     let numHeads: Int
     let scale: Float
@@ -1686,14 +1771,7 @@ private final class VisionAttention: Module {
     }
 
     private func getRelPos(qSize: Int, kSize: Int, relPos: MLXArray) -> MLXArray {
-        let maxRelDist = 2 * max(qSize, kSize) - 1
-        var relPosResized = relPos
-        if relPos.dim(0) != maxRelDist {
-            let scale = Float(maxRelDist) / Float(relPos.dim(0))
-            relPosResized = Upsample(scaleFactor: [scale], mode: .linear(alignCorners: false))(
-                relPos.expandedDimensions(axis: 0)
-            ).squeezed(axis: 0)
-        }
+        let relPosResized = resizedRelativePositions(relPos, length: 2 * max(qSize, kSize) - 1)
         let qCoords = MLXArray(
             (0 ..< qSize).map { Float($0) * max(Float(kSize) / Float(qSize), 1.0) })
         let kCoords = MLXArray(
@@ -1923,15 +2001,13 @@ private final class VisionEncoder: Module {
         }
     }
 
-    private func interpolatedPositionalEmbedding(_ posEmbed: MLXArray, height: Int, width: Int)
+    func interpolatedPositionalEmbedding(_ posEmbed: MLXArray, height: Int, width: Int)
         -> MLXArray
     {
         if posEmbed.dim(1) == height && posEmbed.dim(2) == width {
             return posEmbed
         }
-        let scaleH = Float(height) / Float(posEmbed.dim(1))
-        let scaleW = Float(width) / Float(posEmbed.dim(2))
-        return Upsample(scaleFactor: [scaleH, scaleW], mode: .cubic(alignCorners: false))(posEmbed)
+        return antialiasedBicubicResize(posEmbed, height: height, width: width)
     }
 
     func callAsFunction(_ pixelValues: MLXArray) -> MLXArray {
@@ -1950,6 +2026,16 @@ private final class VisionEncoder: Module {
         hidden = net3(hidden)
         return hidden
     }
+}
+
+/// Resizes a `[B, H, W, C]` position grid as the authors' `F.interpolate(mode="bicubic",
+/// antialias=True)` does (`deepencoder.py`), in float32 like the reference.
+private func antialiasedBicubicResize(_ grid: MLXArray, height: Int, width: Int) -> MLXArray {
+    let rows = MediaProcessing.antialiasedBicubicWeights(input: grid.dim(1), output: height)
+    let columns = MediaProcessing.antialiasedBicubicWeights(input: grid.dim(2), output: width)
+    let channelsFirst = grid.asType(.float32).transposed(0, 3, 1, 2)
+    return matmul(matmul(rows, channelsFirst), columns.transposed())
+        .transposed(0, 2, 3, 1).asType(grid.dtype)
 }
 
 private struct ClipVisionConfig {
@@ -1986,7 +2072,7 @@ private final class ClipVisionEmbeddings: Module {
         ])
     }
 
-    private func resizedPositionEmbedding(targetSize: Int) -> MLXArray {
+    func resizedPositionEmbedding(targetSize: Int) -> MLXArray {
         if positionEmbedding.dim(1) == targetSize {
             return positionEmbedding
         }
@@ -1997,13 +2083,9 @@ private final class ClipVisionEmbeddings: Module {
         if sourceSize == destinationSize {
             return positionEmbedding
         }
-        let resized = Upsample(
-            scaleFactor: [
-                Float(destinationSize) / Float(sourceSize),
-                Float(destinationSize) / Float(sourceSize),
-            ],
-            mode: .cubic(alignCorners: false)
-        )(patchEmbedding.reshaped(1, sourceSize, sourceSize, config.hiddenSize))
+        let resized = antialiasedBicubicResize(
+            patchEmbedding.reshaped(1, sourceSize, sourceSize, config.hiddenSize),
+            height: destinationSize, width: destinationSize)
         return concatenated(
             [clsToken, resized.reshaped(1, destinationSize * destinationSize, config.hiddenSize)],
             axis: 1)
@@ -2038,8 +2120,8 @@ private final class ClipFeedForward: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // mlx-vlm deepseekocr Vision MLP uses nn.GELU (not OpenAI QuickGELU).
-        fc2(gelu(fc1(x)))
+        // The authors' CLIP MLP uses quick_gelu, x * sigmoid(1.702 * x) (`deepencoder.py`).
+        fc2(geluFastApproximate(fc1(x)))
     }
 }
 

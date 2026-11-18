@@ -37,6 +37,35 @@ final class DeepseekOCRLanguageTests: XCTestCase {
         XCTAssertEqual(scores.min() ?? .nan, 1 / (1 + expf(1)), accuracy: 1e-4)
     }
 
+    /// The shipped packs route with `scoring_func: "softmax"` and `topk_method: "greedy"`
+    /// (`TextConfig`'s defaults, which DeepSeek-OCR and Unlimited-OCR both take); the sigmoid
+    /// test above exercises a branch neither pack uses. Gate logits `[2, 1, 0, -1]` put experts
+    /// 0 and 1 on top, and with `norm_topk_prob: false` and `routed_scaling_factor: 1.0` the
+    /// returned weights are the raw softmax scores.
+    func testMoEGateRoutesTheShippedSoftmaxGreedyBranch() throws {
+        let model = try makeMoEModel(topkMethod: "greedy", scoringFunc: "softmax")
+        let gateWeights = concatenated([MLX.eye(4), zeros([4, 28], type: Float.self)], axis: 1)
+
+        try model.update(
+            parameters: ModuleParameters.unflattened([
+                "model.layers.0.mlp.gate.weight": gateWeights
+            ]),
+            verify: [])
+
+        let hiddenPrefix = MLXArray([Float](arrayLiteral: 2, 1, 0, -1)).reshaped(1, 1, 4)
+        let hidden = concatenated([hiddenPrefix, zeros([1, 1, 28], type: Float.self)], axis: -1)
+        let routed = try XCTUnwrap(model.routeLayerForTesting(hidden, layerIndex: 0))
+
+        let indices = routed.0.reshaped(-1).asArray(Int32.self).map(Int.init)
+        let scores = routed.1.reshaped(-1).asArray(Float.self)
+
+        let softmax = [2.0, 1.0, 0.0, -1.0].map { expf(Float($0)) }
+        let total = softmax.reduce(0, +)
+        XCTAssertEqual(Set(indices), [0, 1], "the two highest gate logits win")
+        XCTAssertEqual(scores.max() ?? .nan, softmax[0] / total, accuracy: 1e-4)
+        XCTAssertEqual(scores.min() ?? .nan, softmax[1] / total, accuracy: 1e-4)
+    }
+
     func testSanitizeStacksQuantizedExpertWeightsIntoSwitchMLP() throws {
         let model = try makeMoEModel()
         let weights: [String: MLXArray] = [
@@ -127,7 +156,9 @@ final class DeepseekOCRLanguageTests: XCTestCase {
         XCTAssertEqual(sanitized["model.layers.0.mlp.gate.e_score_correction_bias"]?.shape, [4])
     }
 
-    private func makeMoEModel(topkMethod: String = "noaux_tc") throws -> DeepseekOCR {
+    private func makeMoEModel(
+        topkMethod: String = "noaux_tc", scoringFunc: String = "sigmoid"
+    ) throws -> DeepseekOCR {
         let config = try JSONDecoder().decode(
             DeepseekOCRConfiguration.self,
             from: Data(
@@ -135,6 +166,10 @@ final class DeepseekOCRLanguageTests: XCTestCase {
                     .replacingOccurrences(
                         of: "\"topk_method\": \"noaux_tc\"",
                         with: "\"topk_method\": \"\(topkMethod)\""
+                    )
+                    .replacingOccurrences(
+                        of: "\"scoring_func\": \"sigmoid\"",
+                        with: "\"scoring_func\": \"\(scoringFunc)\""
                     )
                     .utf8))
         return DeepseekOCR(config)

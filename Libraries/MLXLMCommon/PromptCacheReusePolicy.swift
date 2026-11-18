@@ -21,14 +21,29 @@ enum PromptCacheReuseDecision: Equatable {
     /// reproduce, in which case the ledger diverges from the render by design.
     case appendSuffix(suffixStart: Int, representedTokens: [Int])
 
-    /// Feed a suffix into the main cache while discarding an unusable draft
-    /// cache. The current generation must use the main model only; a later
-    /// turn may rebuild a draft cache from a reproducible prompt.
+    /// Feed a suffix into the main cache while discarding unusable speculative
+    /// state (an ordinary draft cache or an MTP continuation). The current
+    /// generation must use the main model only.
     case appendSuffixToMain(suffixStart: Int, representedTokens: [Int])
+
+    /// The cache already represents a usable prefix, but this turn introduces
+    /// new media, so a plain token slice would drop the payload that belongs
+    /// to the suffix. Ask the model to split its own prepared input at
+    /// `suffixStart`; afterwards the cache represents `representedTokens`.
+    ///
+    /// Only the model knows which part of a prepared input belongs to the
+    /// suffix, so this decision -- like ``trimToCommonPrefix`` -- can fail while
+    /// being applied. A model that declines the split must be downgraded to
+    /// ``rebuild`` before prefilling.
+    case appendMediaSuffix(suffixStart: Int, representedTokens: [Int])
 
     /// Rewind every cache by `trimCount` (down to `commonPrefixLength`), then
     /// feed `promptTokens[commonPrefixLength...]`.
     case trimToCommonPrefix(commonPrefixLength: Int, trimCount: Int)
+
+    /// Rewind only the target cache, discard speculative state, and continue
+    /// target-only from the common prefix.
+    case trimToCommonPrefixMainOnly(commonPrefixLength: Int, trimCount: Int)
 
     /// The cache cannot be reconciled with this prompt. Discard it, drop any
     /// carried model state, and feed the whole prompt.
@@ -37,7 +52,8 @@ enum PromptCacheReuseDecision: Equatable {
     /// `true` when a non-empty cached prefix is carried into this turn.
     var reusesCachedPrefix: Bool {
         switch self {
-        case .appendSuffix, .appendSuffixToMain, .trimToCommonPrefix:
+        case .appendSuffix, .appendSuffixToMain, .appendMediaSuffix, .trimToCommonPrefix,
+            .trimToCommonPrefixMainOnly:
             return true
         case .prefillAll, .rebuild:
             return false
@@ -88,6 +104,44 @@ struct PromptCacheTurn: Sendable {
     /// rules use this to avoid resuming from a private main-cache path with a
     /// missing or divergent draft cache.
     var usesSpeculativeDecoding: Bool = false
+
+    /// The model can split a prepared input into a media-carrying suffix, so an
+    /// append-only media turn has a way to reuse the cached prefix. The session
+    /// reports the capability here rather than the policy inspecting the model,
+    /// which keeps the decision table free of MLX and session types.
+    ///
+    /// Capability is not a guarantee: the split may still be declined for a
+    /// specific input, which the caller handles when applying the decision.
+    var canSplitPreparedMedia: Bool = false
+}
+
+/// What speculative-cache reuse can safely accompany the authoritative main cache.
+enum SpeculativeCacheReuseCapability: Sendable {
+    /// Aligned speculative state can follow both suffix appends and target rewinds.
+    case reusable
+
+    /// Aligned speculative state can follow suffix appends, but a rewind must
+    /// discard it and continue with the main cache only.
+    case appendOnly
+
+    /// Missing ordinary draft-model state can be reconstructed from the full prompt.
+    case rebuildableFromPrompt
+
+    /// Speculative state cannot be used, but the valid main cache may continue alone.
+    case mainOnlyFallback
+
+    /// Speculative state can neither be reused nor reconstructed for this prompt.
+    case unavailable
+
+    /// Whether an existing speculative continuation can be used without rebuilding it.
+    var canContinueWithoutRebuild: Bool {
+        switch self {
+        case .reusable, .appendOnly:
+            true
+        case .rebuildableFromPrompt, .mainOnlyFallback, .unavailable:
+            false
+        }
+    }
 }
 
 /// What the caches currently hold.
@@ -103,17 +157,11 @@ struct PromptCacheState: Sendable {
     /// The main cache's timeline agrees with the ledger length.
     var mainCacheIsAligned: Bool = false
 
-    /// A live draft cache is available for the next generation.
-    var hasDraftCache: Bool = false
+    /// The valid operations available for the auxiliary speculative state.
+    var speculativeReuseCapability: SpeculativeCacheReuseCapability = .unavailable
 
-    /// The draft cache's timeline agrees with the ledger length. This remains
-    /// `true` when no draft exists so generic main-only cache decisions keep
-    /// their existing behavior; protocol rules can inspect `hasDraftCache`
-    /// when absence matters.
-    var draftCacheIsAligned: Bool = true
-
-    /// Every cache supports rewinding.
-    var isTrimmable: Bool = false
+    /// Exact rewind limit across all participating layers.
+    var maxTrimCount: Int = 0
 }
 
 /// One reusability rule.
@@ -135,6 +183,7 @@ struct PromptCacheReusePolicy: Sendable {
     /// Rules that apply to every model, in priority order.
     static let standardRules: [any PromptCacheReuseRule] = [
         ExtendCachedPrefixRule(),
+        AppendOnlyMediaRule(),
         RewindToCommonPrefixRule(),
     ]
 
@@ -166,7 +215,6 @@ struct ExtendCachedPrefixRule: PromptCacheReuseRule {
     func reuse(turn: PromptCacheTurn, cache: PromptCacheState) -> PromptCacheReuseDecision? {
         guard !cache.cachedTokens.isEmpty,
             cache.mainCacheIsAligned,
-            cache.draftCacheIsAligned,
             !turn.carriesNewMedia,
             !turn.carriesAttentionMask,
             turn.promptTokens.count > cache.cachedTokens.count,
@@ -175,7 +223,55 @@ struct ExtendCachedPrefixRule: PromptCacheReuseRule {
             return nil
         }
 
+        if turn.usesSpeculativeDecoding {
+            switch cache.speculativeReuseCapability {
+            case .reusable, .appendOnly, .rebuildableFromPrompt:
+                return .appendSuffix(
+                    suffixStart: cache.cachedTokens.count,
+                    representedTokens: turn.promptTokens)
+            case .mainOnlyFallback:
+                return .appendSuffixToMain(
+                    suffixStart: cache.cachedTokens.count,
+                    representedTokens: turn.promptTokens)
+            case .unavailable:
+                return nil
+            }
+        }
+
         return .appendSuffix(
+            suffixStart: cache.cachedTokens.count, representedTokens: turn.promptTokens)
+    }
+}
+
+/// Appends the trailing tokens when a turn adds media to an otherwise unchanged
+/// transcript.
+///
+/// An append-only media turn extends the cached prefix exactly as a text turn
+/// does, so ``ExtendCachedPrefixRule`` would accept it but for its
+/// `carriesNewMedia` guard: a plain token slice drops the media payload that
+/// belongs to the suffix. The split itself is the model's job, so this rule only
+/// fires when the session reports the model can perform it.
+///
+/// Unlike ``ExtendCachedPrefixRule`` this rule does **not** require the absence
+/// of an attention mask. A VL processor pairs media with an all-ones mask as a
+/// matter of course, so refusing masks here would disable the path for exactly
+/// the inputs it exists to serve. Distinguishing that benign mask from a real
+/// padding mask needs the model's own layout knowledge, so the check belongs to
+/// the splitter, which refuses anything that is not all-ones.
+struct AppendOnlyMediaRule: PromptCacheReuseRule {
+    func reuse(turn: PromptCacheTurn, cache: PromptCacheState) -> PromptCacheReuseDecision? {
+        guard turn.carriesNewMedia,
+            turn.canSplitPreparedMedia,
+            !turn.usesSpeculativeDecoding,
+            !cache.cachedTokens.isEmpty,
+            cache.mainCacheIsAligned,
+            turn.promptTokens.count > cache.cachedTokens.count,
+            turn.promptTokens.starts(with: cache.cachedTokens)
+        else {
+            return nil
+        }
+
+        return .appendMediaSuffix(
             suffixStart: cache.cachedTokens.count, representedTokens: turn.promptTokens)
     }
 }
@@ -201,8 +297,7 @@ struct RewindToCommonPrefixRule: PromptCacheReuseRule {
             && commonPrefixLength < turn.promptTokens.count
             && trimCount > 0
             && cache.mainCacheIsAligned
-            && cache.draftCacheIsAligned
-            && cache.isTrimmable
+            && trimCount <= cache.maxTrimCount
             && !turn.carriesNewMedia
             && !turn.carriesPreparedMedia
             && !turn.carriesAttentionMask
@@ -214,6 +309,19 @@ struct RewindToCommonPrefixRule: PromptCacheReuseRule {
             // Rebuild rather than combining a mismatched prompt with stale
             // model state.
             return .rebuild
+        }
+
+        if turn.usesSpeculativeDecoding {
+            switch cache.speculativeReuseCapability {
+            case .reusable, .rebuildableFromPrompt:
+                return .trimToCommonPrefix(
+                    commonPrefixLength: commonPrefixLength, trimCount: trimCount)
+            case .appendOnly, .mainOnlyFallback:
+                return .trimToCommonPrefixMainOnly(
+                    commonPrefixLength: commonPrefixLength, trimCount: trimCount)
+            case .unavailable:
+                return .rebuild
+            }
         }
 
         return .trimToCommonPrefix(commonPrefixLength: commonPrefixLength, trimCount: trimCount)
