@@ -38,4 +38,12 @@ public actor ProcessorTypeRegistry {
         return try creator(configuration, tokenizer)
     }
 
+    /// Whether a creator is registered for `processorType` — i.e. this registry can
+    /// instantiate that processor. Lets a caller check support without attempting a
+    /// (throwing, allocating) `createModel`, e.g. to decide whether a checkpoint's
+    /// declared processor class is one this registry can load.
+    public func contains(_ processorType: String) -> Bool {
+        creators[processorType] != nil
+    }
+
 }
