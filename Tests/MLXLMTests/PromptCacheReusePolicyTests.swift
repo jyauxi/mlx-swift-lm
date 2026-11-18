@@ -19,7 +19,9 @@ struct PromptCacheReusePolicyTests {
         preparedMedia: Bool = false,
         attentionMask: Bool = false,
         modelState: Bool = false,
-        toolResultContinuation: Bool = false
+        toolResultContinuation: Bool = false,
+        speculative: Bool = false,
+        canSplitMedia: Bool = false
     ) -> PromptCacheTurn {
         PromptCacheTurn(
             promptTokens: prompt,
@@ -27,7 +29,9 @@ struct PromptCacheReusePolicyTests {
             carriesPreparedMedia: preparedMedia,
             carriesAttentionMask: attentionMask,
             carriesModelState: modelState,
-            isToolResultContinuation: toolResultContinuation)
+            isToolResultContinuation: toolResultContinuation,
+            usesSpeculativeDecoding: speculative,
+            canSplitPreparedMedia: canSplitMedia)
     }
 
     /// A cache whose model-wide timeline agrees with `cached`, unless
@@ -35,7 +39,7 @@ struct PromptCacheReusePolicyTests {
     private func alignedCache(
         _ cached: [Int],
         processed: Int? = nil,
-        draftAligned: Bool = true,
+        speculativeReuseCapability: SpeculativeCacheReuseCapability = .unavailable,
         trimmable: Bool = true
     ) -> PromptCacheState {
         let processedTokenCount = processed ?? cached.count
@@ -43,8 +47,8 @@ struct PromptCacheReusePolicyTests {
             cachedTokens: cached,
             processedTokenCount: processedTokenCount,
             mainCacheIsAligned: processedTokenCount == cached.count,
-            draftCacheIsAligned: draftAligned,
-            isTrimmable: trimmable)
+            speculativeReuseCapability: speculativeReuseCapability,
+            maxTrimCount: trimmable ? cached.count : 0)
     }
 
     // MARK: - Fresh and empty caches
@@ -64,7 +68,7 @@ struct PromptCacheReusePolicyTests {
             cachedTokens: [],
             processedTokenCount: 12,
             mainCacheIsAligned: false,
-            isTrimmable: true)
+            maxTrimCount: 12)
 
         #expect(
             PromptCacheReusePolicy().decide(turn: turn(prompt: [1, 2, 3]), cache: cache) == .rebuild
@@ -91,10 +95,19 @@ struct PromptCacheReusePolicyTests {
 
     @Test func `a misaligned draft cache blocks suffix reuse`() {
         let decision = PromptCacheReusePolicy().decide(
-            turn: turn(prompt: [1, 2, 3, 4]),
-            cache: alignedCache([1, 2, 3], draftAligned: false))
+            turn: turn(prompt: [1, 2, 3, 4], speculative: true),
+            cache: alignedCache([1, 2, 3], speculativeReuseCapability: .unavailable))
 
         #expect(decision == .rebuild)
+    }
+
+    @Test func `a missing ordinary draft remains tentatively rebuildable`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 4], speculative: true),
+            cache: alignedCache(
+                [1, 2, 3], speculativeReuseCapability: .rebuildableFromPrompt))
+
+        #expect(decision == .appendSuffix(suffixStart: 3, representedTokens: [1, 2, 3, 4]))
     }
 
     @Test func `new media invalidates the cached text prefix`() {
@@ -104,11 +117,91 @@ struct PromptCacheReusePolicyTests {
         #expect(decision == .rebuild)
     }
 
+    // MARK: - Append-only media turns
+
+    @Test func `an append-only media turn appends its suffix when the model can split`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 4], newMedia: true, canSplitMedia: true),
+            cache: alignedCache([1, 2, 3]))
+
+        #expect(
+            decision == .appendMediaSuffix(suffixStart: 3, representedTokens: [1, 2, 3, 4]))
+        #expect(decision.reusesCachedPrefix)
+    }
+
+    /// A VL processor pairs media with an all-ones mask as a matter of course, so
+    /// the media path must not inherit ``ExtendCachedPrefixRule``'s mask guard --
+    /// doing so would disable it for exactly the inputs it serves. Telling a
+    /// benign mask from a real padding mask needs the model's layout knowledge,
+    /// so that check belongs to the splitter.
+    @Test func `a benign attention mask does not block the media split`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(
+                prompt: [1, 2, 3, 4], newMedia: true, attentionMask: true, canSplitMedia: true),
+            cache: alignedCache([1, 2, 3]))
+
+        #expect(
+            decision == .appendMediaSuffix(suffixStart: 3, representedTokens: [1, 2, 3, 4]))
+    }
+
+    @Test func `a model that cannot split keeps the rebuild on a media turn`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3, 4], newMedia: true, canSplitMedia: false),
+                cache: alignedCache([1, 2, 3])) == .rebuild)
+    }
+
+    @Test func `speculative decoding blocks the media split`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(
+                    prompt: [1, 2, 3, 4], newMedia: true, speculative: true,
+                    canSplitMedia: true),
+                cache: alignedCache([1, 2, 3])) == .rebuild)
+    }
+
+    @Test func `a media turn that diverges from the cache does not split`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 9, 9], newMedia: true, canSplitMedia: true),
+            cache: alignedCache([1, 2, 3]))
+
+        #expect(decision == .rebuild)
+    }
+
+    @Test func `a misaligned draft cache blocks the media split`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(
+                    prompt: [1, 2, 3, 4], newMedia: true, speculative: true,
+                    canSplitMedia: true),
+                cache: alignedCache([1, 2, 3], speculativeReuseCapability: .unavailable))
+                == .rebuild)
+    }
+
     @Test func `an explicit attention mask blocks suffix reuse`() {
         let decision = PromptCacheReusePolicy().decide(
             turn: turn(prompt: [1, 2, 3, 4], attentionMask: true), cache: alignedCache([1, 2, 3]))
 
         #expect(decision == .rebuild)
+    }
+
+    @Test func `aligned resumable MTP state appends only the suffix`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 4], speculative: true),
+            cache: alignedCache([1, 2, 3], speculativeReuseCapability: .appendOnly))
+
+        #expect(decision == .appendSuffix(suffixStart: 3, representedTokens: [1, 2, 3, 4]))
+    }
+
+    @Test func `missing MTP continuation preserves the target prefix target-only`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 4], speculative: true),
+            cache: alignedCache([1, 2, 3], speculativeReuseCapability: .mainOnlyFallback))
+
+        #expect(
+            decision
+                == .appendSuffixToMain(
+                    suffixStart: 3, representedTokens: [1, 2, 3, 4]))
     }
 
     // MARK: - Rewind to the common prefix
@@ -125,6 +218,41 @@ struct PromptCacheReusePolicyTests {
         #expect(
             PromptCacheReusePolicy().decide(
                 turn: turn(prompt: [9, 9, 9]), cache: alignedCache([1, 2, 3])) == .rebuild)
+    }
+
+    @Test func `stateful MTP rewind keeps only the authoritative target cache`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 9, 9], speculative: true),
+            cache: alignedCache(
+                [1, 2, 3, 4, 5], speculativeReuseCapability: .appendOnly))
+
+        #expect(
+            decision
+                == .trimToCommonPrefixMainOnly(
+                    commonPrefixLength: 2, trimCount: 3))
+    }
+
+    @Test func `stateless MTP can follow a target rewind`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 9, 9], speculative: true),
+            cache: alignedCache([1, 2, 3, 4, 5], speculativeReuseCapability: .reusable))
+
+        #expect(decision == .trimToCommonPrefix(commonPrefixLength: 2, trimCount: 3))
+    }
+
+    @Test(arguments: [
+        SpeculativeCacheReuseCapability.reusable, .appendOnly,
+        .rebuildableFromPrompt, .mainOnlyFallback,
+    ])
+    func `speculative rewinds respect the exact cache rewind limit`(
+        capability: SpeculativeCacheReuseCapability
+    ) {
+        var cache = alignedCache([1, 2, 3, 4, 5], speculativeReuseCapability: capability)
+        cache.maxTrimCount = 2
+
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 9, 9], speculative: true), cache: cache) == .rebuild)
     }
 
     @Test(arguments: [

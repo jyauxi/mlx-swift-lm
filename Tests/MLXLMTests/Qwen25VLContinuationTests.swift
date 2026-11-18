@@ -6,13 +6,14 @@
 // however a prompt reaches the KV cache — one shot, windowed chunks, or split
 // across a warm continuation — the next-token logits must match, because M-RoPE
 // positions must be anchored at the cache offset (plus the carried rope delta),
-// never restarted at zero.
+// never restarted at zero. Image prompts must also keep the cache in the model dtype.
 
 import Foundation
 import MLX
 import MLXLMCommon
-import MLXVLM
 import XCTest
+
+@testable import MLXVLM
 
 final class Qwen25VLContinuationTests: XCTestCase {
 
@@ -113,6 +114,32 @@ final class Qwen25VLContinuationTests: XCTestCase {
     private let continuation = ContinuationAssertions(
         imageTokenId: 500, visionStartTokenId: 502)
 
+    /// M-RoPE computes cos and sin in float32. Without a cast back, an image prompt caches
+    /// float32 keys, and every later layer runs and caches in float32 too.
+    private func assertImagePromptKeepsCacheDtype<M: LanguageModel>(
+        _ model: M, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        model.apply { $0.dtype.isFloatingPoint ? $0.asType(.float16) : $0 }
+        try withRandomState(MLXRandom.RandomState(seed: 5)) {
+            let tokens = concatenated(
+                [continuation.textTokens(10), continuation.imageRun(), continuation.textTokens(8)],
+                axis: 1)
+            let cache = try model.newCache(parameters: nil)
+            let result = try model.prepare(
+                LMInput(text: .init(tokens: tokens), image: continuation.image()),
+                cache: cache, state: nil, prefill: PrefillParameters())
+            let (_, state) = try continuation.lastLogits(result)
+            let step = model(
+                LMInput.Text(tokens: continuation.textTokens(1)), cache: cache, state: state)
+            eval(step.logits)
+
+            for layer in cache {
+                XCTAssertEqual(
+                    layer.state.map(\.dtype), [.float16, .float16], file: file, line: line)
+            }
+        }
+    }
+
     // MARK: - Qwen2.5-VL
 
     func testQwen25VLWarmTextContinuationMatchesFullPrefill() throws {
@@ -121,6 +148,10 @@ final class Qwen25VLContinuationTests: XCTestCase {
 
     func testQwen25VLWarmImageContinuationMatchesFullPrefill() throws {
         try continuation.assertWarmImageContinuation(makeTinyQwen25VL())
+    }
+
+    func testQwen25VLSplitMediaSuffixContinuationMatchesFullPrefill() throws {
+        try continuation.assertSplitMediaSuffixContinuation(makeTinyQwen25VL())
     }
 
     func testQwen25VLImageMidContinuationResumeState() throws {
@@ -133,6 +164,20 @@ final class Qwen25VLContinuationTests: XCTestCase {
 
     func testQwen25VLWindowedImagePrefillMatchesSingleShot() throws {
         try continuation.assertWindowedImagePrefill(makeTinyQwen25VL())
+    }
+
+    /// Through the `PreparedInputSplitting` conformance, so the config-derived token
+    /// ids and merge size are exercised alongside the split itself.
+    func testQwen25VLAppendOnlyMediaSplitMatchesFullPrefill() throws {
+        let model = try makeTinyQwen25VL()
+        try continuation.assertAppendOnlyMediaSplit(
+            model,
+            split: { (model as PreparedInputSplitting).splitPreparedInput($0, droppingFirst: $1) },
+            expectsIsolation: true)
+    }
+
+    func testQwen25VLImagePromptKeepsCacheDtype() throws {
+        try assertImagePromptKeepsCacheDtype(makeTinyQwen25VL())
     }
 
     // MARK: - Qwen2-VL
@@ -155,5 +200,26 @@ final class Qwen25VLContinuationTests: XCTestCase {
 
     func testQwen2VLWindowedImagePrefillMatchesSingleShot() throws {
         try continuation.assertWindowedImagePrefill(makeTinyQwen2VL())
+    }
+
+    func testQwen2VLImagePromptKeepsCacheDtype() throws {
+        try assertImagePromptKeepsCacheDtype(makeTinyQwen2VL())
+    }
+
+    /// `Qwen2VL` vision attention stays inside each image, so the split is exact.
+    /// `Qwen2VL` does not conform, so the split runs through `QwenVL` directly.
+    func testQwen2VLAppendOnlyMediaSplitMatchesFullPrefill() throws {
+        let model = try makeTinyQwen2VL()
+        try continuation.assertAppendOnlyMediaSplit(
+            model,
+            split: {
+                QwenVL.splitPreparedInput(
+                    $0,
+                    droppingFirst: $1,
+                    imageTokenId: model.config.baseConfiguration.imageTokenId,
+                    videoTokenId: model.config.baseConfiguration.videoTokenId,
+                    mergeSize: model.config.visionConfiguration.spatialMergeSize)
+            },
+            expectsIsolation: true)
     }
 }
