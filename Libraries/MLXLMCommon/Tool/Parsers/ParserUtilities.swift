@@ -61,9 +61,9 @@ func getParameterType(
         guard let function = tool["function"] as? [String: any Sendable],
             function["name"] as? String == funcName,
             let parameters = function["parameters"] as? [String: any Sendable],
-            let properties = parameters["properties"] as? [String: any Sendable],
-            let param = properties[paramName] as? [String: any Sendable],
-            let type = param["type"] as? String
+            let candidates = propertySchemas(in: parameters)[paramName],
+            let type = candidates.first?["type"] as? String,
+            candidates.allSatisfy({ $0["type"] as? String == type })
         else { continue }
         return type
     }
@@ -78,12 +78,38 @@ func getParameterConfig(
     for tool in tools {
         guard let function = tool["function"] as? [String: any Sendable],
             function["name"] as? String == funcName,
-            let parameters = function["parameters"] as? [String: any Sendable],
-            let properties = parameters["properties"] as? [String: any Sendable]
+            let parameters = function["parameters"] as? [String: any Sendable]
         else { continue }
-        return properties
+        if let properties = parameters["properties"] as? [String: any Sendable] {
+            return properties
+        }
+        return propertySchemas(in: parameters).mapValues { candidates in
+            candidates.count == 1 ? candidates[0] : ["anyOf": candidates]
+        }
     }
     return [:]
+}
+
+/// The schemas a parameters schema declares for each property.
+///
+/// An object schema declares one schema per property. A root `anyOf` or `oneOf`
+/// of object schemas declares, for each property, the schema from every branch
+/// that has it.
+func propertySchemas(
+    in parameters: [String: any Sendable]
+) -> [String: [[String: any Sendable]]] {
+    if let properties = parameters["properties"] as? [String: any Sendable] {
+        return properties.compactMapValues { ($0 as? [String: any Sendable]).map { [$0] } }
+    }
+    var schemas: [String: [[String: any Sendable]]] = [:]
+    for keyword in ["anyOf", "oneOf"] {
+        for branch in parameters[keyword] as? [[String: any Sendable]] ?? [] {
+            for (name, candidates) in propertySchemas(in: branch) {
+                schemas[name, default: []].append(contentsOf: candidates)
+            }
+        }
+    }
+    return schemas
 }
 
 // MARK: - Schema Type Extraction
@@ -173,11 +199,12 @@ func convertParameterValue(
 ) -> any Sendable {
     guard let tools,
         let parameters = ToolSchemaValidator.parametersSchema(ofToolNamed: funcName, in: tools),
-        let properties = parameters["properties"] as? [String: any Sendable]
+        let candidates = propertySchemas(in: parameters)[paramName]
     else { return value }
-    return ToolArgumentNormalization.normalize(
-        .string(value), schema: properties[paramName] as? [String: any Sendable]
-    ).sendableValue
+    // A union parameters root declares the property once per branch that has it.
+    let schema: [String: any Sendable] =
+        candidates.count == 1 ? candidates[0] : ["anyOf": candidates]
+    return ToolArgumentNormalization.normalize(.string(value), schema: schema).sendableValue
 }
 
 // MARK: - String Utilities
