@@ -199,11 +199,12 @@ func convertParameterValue(
 ) -> any Sendable {
     guard let tools,
         let parameters = ToolSchemaValidator.parametersSchema(ofToolNamed: funcName, in: tools),
-        let properties = parameters["properties"] as? [String: any Sendable]
+        let candidates = propertySchemas(in: parameters)[paramName]
     else { return value }
-    return ToolArgumentNormalization.normalize(
-        .string(value), schema: properties[paramName] as? [String: any Sendable]
-    ).sendableValue
+    // A union parameters root declares the property once per branch that has it.
+    let schema: [String: any Sendable] =
+        candidates.count == 1 ? candidates[0] : ["anyOf": candidates]
+    return ToolArgumentNormalization.normalize(.string(value), schema: schema).sendableValue
 }
 
 // MARK: - String Utilities
