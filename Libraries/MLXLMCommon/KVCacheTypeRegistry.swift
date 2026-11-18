@@ -32,6 +32,7 @@ final class KVCacheTypeRegistry: @unchecked Sendable {
     private init() {
         try! register(KVCacheSimple.self, aliases: ["KVCacheSimple"])
         try! register(RotatingKVCache.self)
+        try! register(RingSlidingKVCache.self)
         try! register(QuantizedKVCache.self)
         try! register(VarianceNormalizedKVCache.self)
         try! register(ChunkedKVCache.self)

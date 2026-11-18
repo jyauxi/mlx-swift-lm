@@ -159,12 +159,14 @@ public enum VLMProcessorTypeRegistry {
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
-        "DeepseekOCRProcessor": create(
-            DeepseekOCRProcessorConfiguration.self, DeepseekOCRProcessor.init),
-        "DeepseekVLV2Processor": create(
-            DeepseekOCRProcessorConfiguration.self, DeepseekOCRProcessor.init),
+        "DeepseekOCRProcessor": create(DeepseekOCRProcessorConfiguration.self) {
+            DeepseekOCRProcessor($0, tokenizer: $1)
+        },
+        "DeepseekVLV2Processor": create(DeepseekOCRProcessorConfiguration.self) {
+            DeepseekOCRProcessor($0, tokenizer: $1)
+        },
         "UnlimitedOCRProcessor": create(
-            UnlimitedOCRProcessorConfiguration.self, UnlimitedOCRProcessor.init),
+            UnlimitedOCRProcessorConfiguration.self, DeepseekOCRProcessor.unlimited),
         "MuseGlimmerProcessor": create(
             MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
     ])
@@ -301,6 +303,18 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let qwen3_8_27B_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-4bit",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let qwen3_8_27B_8bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-8bit",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
     /// DeepSeek-OCR.
     ///
     /// > Note: For both OCR entries below the prompt acts as a **mode selector**
@@ -318,20 +332,8 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     /// Unlimited-OCR (DeepSeek-OCR encoder + decoder with R-SWA attention).
     static public let unlimitedOCR6bit = ModelConfiguration(
-        id: "majentik/Unlimited-OCR-MLX-6bit",
+        id: "mlx-community/Unlimited-OCR-6bit",
         defaultPrompt: "document parsing."
-    )
-
-    static public let qwen3_8_27B_4bit = ModelConfiguration(
-        id: "mlx-community/Qwen3.8-27B-4bit",
-        defaultPrompt: "Describe the image in English",
-        extraEOSTokens: ["<|im_end|>"]
-    )
-
-    static public let qwen3_8_27B_8bit = ModelConfiguration(
-        id: "mlx-community/Qwen3.8-27B-8bit",
-        defaultPrompt: "Describe the image in English",
-        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let bonsai2_27B_ternary_2bit = ModelConfiguration(
@@ -368,10 +370,10 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             fastvlm,
             qwen3_5_27B_4bit,
             qwen3_5_35B_A3B_4bit,
-            deepseekOCR5bit,
-            unlimitedOCR6bit,
             qwen3_8_27B_4bit,
             qwen3_8_27B_8bit,
+            deepseekOCR5bit,
+            unlimitedOCR6bit,
             bonsai2_27B_ternary_2bit,
             museGlimmer30B4bit,
         ]
@@ -448,6 +450,7 @@ public final class VLMModelFactory: GenericModelFactory {
     /// `model_type` path can create a separate factory with `false` without
     /// mutable process-global state.
     public let honorOrigModelType: Bool
+
     /// Returns the model's LoRA metadata without loading checkpoint weights or a processor.
     ///
     /// Uses the registered model's `LoRAModel` conformance to select adapter targets.

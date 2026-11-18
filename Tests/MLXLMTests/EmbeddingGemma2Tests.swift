@@ -526,7 +526,7 @@ struct EmbeddingGemma2Tests {
             -0.038181, 0.340234, 0.697947, 0, 0, -0.079327, 1.079327,
         ]
         for (input, output, expected) in [(10, 4, downscale), (4, 7, upscale)] {
-            let weights = EmbeddingGemma2ImageProcessor.bicubicWeights(input: input, output: output)
+            let weights = MediaProcessing.antialiasedBicubicWeights(input: input, output: output)
             #expect(weights.shape == [output, input])
             #expect(
                 zip(weights.asArray(Float.self), expected).allSatisfy { abs($0 - $1) < 0.000002 })
@@ -547,8 +547,8 @@ struct EmbeddingGemma2Tests {
         }
         let pixels = MLXArray(bytes, [1, 3, sourceHeight, sourceWidth]).asType(.float32) / 255
         let compact = pixels.asType(.float16)
-        let rows = EmbeddingGemma2ImageProcessor.bicubicWeights(input: sourceHeight, output: height)
-        let columns = EmbeddingGemma2ImageProcessor.bicubicWeights(
+        let rows = MediaProcessing.antialiasedBicubicWeights(input: sourceHeight, output: height)
+        let columns = MediaProcessing.antialiasedBicubicWeights(
             input: sourceWidth, output: width)
         let dense = matmul(matmul(rows, pixels), columns.transposed())
         let expected = round(clip(dense * 255, min: 0, max: 255)) / 255
@@ -586,9 +586,9 @@ struct EmbeddingGemma2Tests {
             #require(CIImage(data: encoded as Data)))
         let original = MediaProcessing.asMLXArray(image)
         for (targetHeight, targetWidth) in [(height, width), (11, 17)] {
-            let rows = EmbeddingGemma2ImageProcessor.bicubicWeights(
+            let rows = MediaProcessing.antialiasedBicubicWeights(
                 input: height, output: targetHeight)
-            let columns = EmbeddingGemma2ImageProcessor.bicubicWeights(
+            let columns = MediaProcessing.antialiasedBicubicWeights(
                 input: width, output: targetWidth)
             let dense = matmul(matmul(rows, original), columns.transposed())
             let expected =

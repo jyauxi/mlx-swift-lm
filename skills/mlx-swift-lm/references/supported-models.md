@@ -188,8 +188,8 @@ let session = ChatSession(
 let text = try await session.respond(to: "Free OCR.", image: .url(pageURL))
 ```
 
-IntegrationTesting: `DeepseekOCRIntegrationTests` (cache-gated or
-`MLX_RUN_DEEPSEEK_OCR_INTEGRATION=1`). See `Libraries/MLXVLM/README.md`
+IntegrationTesting: `DeepseekOCRIntegrationTests` (cache-gated, or
+`TEST_RUNNER_MLX_RUN_DEEPSEEK_OCR_INTEGRATION=1` with `xcodebuild`). See `Libraries/MLXVLM/README.md`
 for processor modes and grounding tokens.
 
 ### Other VLM Types

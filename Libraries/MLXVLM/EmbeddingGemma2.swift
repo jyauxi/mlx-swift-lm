@@ -96,14 +96,17 @@ package struct EmbeddingGemma2ImageProcessor: Sendable {
     /// `uint8` output. Each pass reads only the nonzero weights and casts pixels as it reads.
     static func resized(_ pixels: MLXArray, height: Int, width: Int) -> MLXArray {
         if Device.defaultDevice().deviceType == .cpu {
-            let rows = bicubicWeights(input: pixels.dim(2), output: height)
-            let columns = bicubicWeights(input: pixels.dim(3), output: width)
+            let rows = MediaProcessing.antialiasedBicubicWeights(
+                input: pixels.dim(2), output: height)
+            let columns = MediaProcessing.antialiasedBicubicWeights(
+                input: pixels.dim(3), output: width)
             let resized = matmul(matmul(rows, pixels.asType(.float32)), columns.transposed())
             return round(clip(resized * 255, min: 0, max: 255)) / 255
         }
         var pixels = pixels
         for (axis, length) in [(2, height), (3, width)] where pixels.dim(axis) != length {
-            let weights = bicubicWeights(input: pixels.dim(axis), output: length)
+            let weights = MediaProcessing.antialiasedBicubicWeights(
+                input: pixels.dim(axis), output: length)
             let parameters = MLXArray([
                 Int32(pixels.dim(2)), Int32(pixels.dim(3)), Int32(length),
                 Int32(axis),
@@ -149,34 +152,6 @@ package struct EmbeddingGemma2ImageProcessor: Sendable {
             output[(channel * outH + y) * outW + x] = value;
             """
     )
-
-    /// `[output, input]` interpolation weights of the antialiased bicubic filter
-    /// (a = -0.5) of Pillow and torchvision.
-    static func bicubicWeights(input: Int, output: Int) -> MLXArray {
-        let scale = Double(input) / Double(output)
-        let filterScale = max(scale, 1)
-        let support = 2 * filterScale
-        var weights = [Float](repeating: 0, count: output * input)
-        for row in 0 ..< output {
-            let center = (Double(row) + 0.5) * scale
-            let first = max(Int(center - support + 0.5), 0)
-            let last = min(Int(center + support + 0.5), input)
-            let taps = (first ..< last).map { cubic((Double($0) - center + 0.5) / filterScale) }
-            let total = taps.reduce(0, +)
-            for (offset, tap) in taps.enumerated() where total != 0 {
-                weights[row * input + first + offset] = Float(tap / total)
-            }
-        }
-        return MLXArray(weights, [output, input])
-    }
-
-    private static func cubic(_ x: Double) -> Double {
-        let a = -0.5
-        let x = abs(x)
-        if x < 1 { return ((a + 2) * x - (a + 3)) * x * x + 1 }
-        if x < 2 { return (((x - 5) * x + 8) * x - 4) * a }
-        return 0
-    }
 }
 
 // MARK: - Video Preparation

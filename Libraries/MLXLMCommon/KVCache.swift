@@ -1183,6 +1183,23 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 ///
 /// Port of Python `mlx_vlm.models.unlimited_ocr.language.RingSlidingKVCache`.
 public class RingSlidingKVCache: BaseKVCache, CustomDebugStringConvertible {
+    public override class var serializedClassName: String? { "RingSlidingKVCache" }
+
+    public override class func restore(
+        state: [MLXArray], metaState: [String]
+    ) throws -> any KVCache {
+        guard metaState.count >= 4, let windowSize = Int(metaState[0]) else {
+            throw KVCacheError(
+                message: "Invalid RingSlidingKVCache metaState - expected 4 values")
+        }
+        let cache = RingSlidingKVCache(windowSize: max(windowSize, 1))
+        if !state.isEmpty {
+            cache.state = state
+        }
+        cache.metaState = metaState
+        return cache
+    }
+
     public private(set) var windowSize: Int
     public private(set) var prefillLength: Int?
     public var step = 256
@@ -1219,14 +1236,14 @@ public class RingSlidingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 self.keys == nil
             }
         if reset {
-            let B = keys.dim(0)
+            let batch = keys.dim(0)
             let kvHeads = keys.dim(1)
             let kHeadDim = keys.dim(3)
             let vHeadDim = values.dim(3)
 
             let nSteps = (step + keys.dim(2) - 1) / step
-            let kShape = [B, kvHeads, nSteps * step, kHeadDim]
-            let vShape = [B, kvHeads, nSteps * step, vHeadDim]
+            let kShape = [batch, kvHeads, nSteps * step, kHeadDim]
+            let vShape = [batch, kvHeads, nSteps * step, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
             let newV = MLXArray.zeros(vShape, dtype: values.dtype)
 

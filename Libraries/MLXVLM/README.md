@@ -123,19 +123,29 @@ let text = try await ChatSession(
 ```
 
 Opt-in IntegrationTesting: `DeepseekOCRIntegrationTests`
-(`MLX_RUN_DEEPSEEK_OCR_INTEGRATION=1` or cached DeepSeek-OCR-5bit).
+(cached DeepSeek-OCR-5bit, or `TEST_RUNNER_MLX_RUN_DEEPSEEK_OCR_INTEGRATION=1` to download it;
+see `Libraries/IntegrationTestHelpers/README.md`).
 
 Tried Unlimited-OCR Hub packs:
 
-- `majentik/Unlimited-OCR-MLX-6bit` (`VLMRegistry.unlimitedOCR6bit`)
+- `mlx-community/Unlimited-OCR-6bit` (`VLMRegistry.unlimitedOCR6bit`)
+- `majentik/Unlimited-OCR-MLX-6bit` (same output; see the note below)
 
 Unlimited-OCR (`model_type`: `unlimited-ocr` / `unlimited_ocr`) reuses the whole
 DeepSeek-OCR stack and swaps the decode cache for `RingSlidingKVCache` (R-SWA), so
 the KV cache stays constant-size no matter how long the output runs. Load it the
 same way, with `VLMRegistry.unlimitedOCR6bit` and its default prompt
-`"document parsing."`.
+`"document parsing."`. The prompt shape follows mlx-vlm's `model_type` keying:
+DeepSeek-OCR prefixes `<image>\n` once per image, Unlimited-OCR a single bare
+`<image>` whatever the page count. The processor the registry builds for each pack
+carries the right shape: `DeepseekOCRProcessor.init` is the DeepSeek-OCR processor,
+and `DeepseekOCRProcessor.unlimited(_:tokenizer:)`, which the `UnlimitedOCRProcessor`
+key calls, is the Unlimited-OCR one.
+`UnlimitedOCRTokenizerIntegrationTests` (IntegrationTesting, cache-gated on
+`mlx-community/Unlimited-OCR-6bit`) builds the processor through that key and
+checks the pack's own chat template renders that single `<image>`.
 
-> Note: these packs ship `model_type: deepseekocr` with
+> Note: the majentik pack ships `model_type: deepseekocr` with
 > `_orig_model_type: unlimited-ocr` as a back-compat shim for loaders predating the
 > Unlimited registration. `VLMModelFactory` honors the original type by default, so
 > such a pack loads as `UnlimitedOCR`. Create a separate `VLMModelFactory` with
@@ -143,12 +153,12 @@ same way, with `VLMRegistry.unlimitedOCR6bit` and its default prompt
 
 ### DeepSeek-OCR processor modes
 
-`DeepseekOCRProcessor` (also used as `UnlimitedOCRProcessor`) supports two modes,
+`DeepseekOCRProcessor` (both packs) supports two modes,
 selected via `ChatSession` / `UserInput` additional context:
 
 | Mode | Context | Behavior (matches Python) |
 |------|---------|---------------------------|
-| `gundam` (default) | omit or `DeepseekOCRProcessor.modeContext(.gundam)` | 1024² global + 640² local tiles when page > 640×640 (`cropping=True`; `max_num` 9, or 32 via `unlimitedContext(.gundam)`) |
+| `gundam` (default) | omit or `DeepseekOCRProcessor.modeContext(.gundam)` | 1024² global + 640² local tiles when page > 640×640 (`cropping=True`; `max_num`: pack default (9 DeepSeek / 32 Unlimited); override with `maxNumTilesContextKey`) |
 | `base` | `DeepseekOCRProcessor.modeContext(.base)` | Single-page: 640² padded view. Multipage (`images.count > 1`): 1024² per page (Unlimited PDF/`infer_multi`). No local tiles (`cropping=False`). |
 
 ```swift
@@ -176,9 +186,11 @@ Hub tokenizers ship `<|grounding|>`, `<|ref|>`/`<|/ref|>`, `<|det|>`/`<|/det|>`
 (IDs 128816–128820). `DeepseekOCRSpecialTokens` resolves IDs through the
 tokenizer and builds prompts (`groundingPrompt()`, `groundingMarkdownPrompt()`,
 `locatePrompt(_:)`). Decode with `skipSpecialTokens: false` so layout tags
-survive; `<|det|>[[x1,y1,x2,y2]]` coordinates are normalized 0–1000 and
-`parseDetections(from:)` extracts boxes. Full structured layout-tree parsing is
-deferred — see the `DeepseekOCRSpecialTokens` doc comment.
+survive. Box coordinates are normalized 0–1000. `parseDetections(from:)` reads
+every box in DeepSeek-OCR's `<|ref|>label<|/ref|><|det|>[[x1,y1,x2,y2], …]<|/det|>`
+and Unlimited-OCR's `<|det|>label [x1,y1,x2,y2], …<|/det|>`, each with its span's
+label. Full structured layout-tree parsing is deferred — see the
+`DeepseekOCRSpecialTokens` doc comment.
 
 ### Optional sliding-window no-repeat n-gram
 
