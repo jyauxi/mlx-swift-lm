@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 import MLXLMCommon
+import MLXScriptedLM
 import XCTest
 
 final class ProcessorTypeRegistryTests: XCTestCase {
@@ -27,7 +28,7 @@ final class ProcessorTypeRegistryTests: XCTestCase {
         do {
             _ = try await registry.createModel(
                 configuration: Data(), processorType: "UnregisteredProcessor",
-                tokenizer: TestTokenizer())
+                tokenizer: PseudoWordTokenizer())
             XCTFail("Expected createModel to throw for an unregistered processor type")
         } catch let error as ModelFactoryError {
             guard case .unsupportedProcessorType("UnregisteredProcessor") = error else {
